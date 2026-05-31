@@ -1,4 +1,4 @@
-﻿# OpenBMC 开发环境一键初始化命令 —— 实施计划
+# OpenBMC 开发环境一键初始化命令 —— 实施计划
 
 > 设计文档：`docs/specs/2026-05-31-obmc-env-init-design.md`
 > 日期：2026-05-31
@@ -132,7 +132,7 @@ HARNESS_ROOT=""      # 本仓库根目录（自动检测）
 WORKSPACE_DIR=""     # workspace/ 路径
 MACHINE=""           # 目标 machine 名称
 OPENBMC_DIR=""       # workspace/openbmc/
-BUILD_DIR=""         # workspace/openbmc/build-<machine>/
+BUILD_DIR=""         # workspace/openbmc/build/<machine>/
 SRC_DIR=""           # workspace/src/<machine>/
 CONFIGS_DIR=""       # workspace/configs/
 VERBOSE=0
@@ -184,7 +184,7 @@ main "$@"
 
 **Step 3 - init_bitbake_env()**：
 - `cd "$OPENBMC_DIR"`
-- `source oe-init-build-env "$BUILD_DIR"`（BUILD_DIR = `build-<machine>`）
+- `source oe-init-build-env "$BUILD_DIR"`（BUILD_DIR = `build/<machine>`）
 - 在 `$BUILD_DIR/conf/local.conf` 中设置 `MACHINE = "<machine>"`
 - 备份 local.conf 为 local.conf.bak.<timestamp>（首次创建时无原文件则跳过备份）
 

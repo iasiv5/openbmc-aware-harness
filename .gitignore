@@ -1,0 +1,3 @@
+# OpenBMC workspace: source trees, builds, lockfiles
+workspace/*
+!workspace/.gitkeep

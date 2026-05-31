@@ -24,6 +24,7 @@
   - **禁止轮询**：agent 运行期间不要反复调用 `background_output`，系统会自动通知
   - 判断标准：任务可拆分为 ≥2 个子任务，每个 ≥5 tool calls
   - 核心参数：并行度 ≤5，调研 overlap 30-50%，代码 overlap 0-20%
+- [OpenBMC 开发环境初始化](./workflow_obmc_env_init.md) — 一键初始化 OpenBMC 开发环境，clone 子仓库，注入 externalsrc 配置。
 
 ### BestPractice（最佳实践）
 

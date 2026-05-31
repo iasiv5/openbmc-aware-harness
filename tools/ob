@@ -1,0 +1,462 @@
+﻿#!/usr/bin/env bash
+# ob - OpenBMC development environment initializer
+# Usage: ob init <machine> [options]
+set -euo pipefail
+
+# === Global Variables ===
+HARNESS_ROOT=""
+WORKSPACE_DIR=""
+MACHINE=""
+OPENBMC_DIR=""
+BUILD_DIR=""
+SRC_DIR=""
+CONFIGS_DIR=""
+VERBOSE=0
+DRY_RUN=0
+SKIP_FETCH=0
+STATUS_SUCCESS=()
+STATUS_FAILED=()
+
+# === Colors ===
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+log()   { echo -e "$*"; }
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+verbose() { [[ "$VERBOSE" -eq 1 ]] && echo -e "[DEBUG] $*"; }
+
+# === Functions ===
+
+usage() {
+    cat <<EOF
+Usage: ob <command> [options] [arguments]
+
+Commands:
+  init <machine>        One-click initialize OpenBMC dev environment
+  status [<machine>]    Show current environment status (future)
+
+Options:
+  --skip-fetch          Skip git clone/fetch of sub-repos
+  --dry-run             Print actions without executing
+  --verbose             Verbose output
+  -h, --help            Show this help
+
+Examples:
+  ob init romulus                  # Initialize romulus machine
+  ob init romulus --dry-run        # Preview what would be done
+  ob init romulus --skip-fetch     # Assume sub-repos already exist locally
+EOF
+}
+
+parse_args() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    local command="$1"
+    shift
+
+    if [[ "$command" != "init" ]]; then
+        error "Unknown command: $command"
+        usage
+        exit 1
+    fi
+
+    if [[ $# -lt 1 ]] || [[ "$1" == --* ]]; then
+        error "Missing <machine> argument for 'init'"
+        usage
+        exit 1
+    fi
+
+    MACHINE="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-fetch)  SKIP_FETCH=1; shift ;;
+            --dry-run)     DRY_RUN=1; shift ;;
+            --verbose)     VERBOSE=1; shift ;;
+            -h|--help)     usage; exit 0 ;;
+            *)             error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+}
+
+detect_harness_root() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    HARNESS_ROOT="$(cd "$script_dir/.." && pwd)"
+    WORKSPACE_DIR="$HARNESS_ROOT/workspace"
+    OPENBMC_DIR="$WORKSPACE_DIR/openbmc"
+    BUILD_DIR="$OPENBMC_DIR/build/$MACHINE"
+    SRC_DIR="$WORKSPACE_DIR/src/$MACHINE"
+    CONFIGS_DIR="$WORKSPACE_DIR/configs"
+    verbose "HARNESS_ROOT=$HARNESS_ROOT"
+    verbose "WORKSPACE_DIR=$WORKSPACE_DIR"
+    verbose "MACHINE=$MACHINE"
+}
+
+prerequisites_check() {
+    info "Step 1/8: Checking prerequisites..."
+
+    # OS check
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        error "This script must run on Linux. Current OS: $(uname -s)"
+        exit 1
+    fi
+    verbose "OS: $(uname -s) OK"
+
+    # Tool check
+    for tool in git python3; do
+        if ! command -v "$tool" &>/dev/null; then
+            error "Required tool not found: $tool"
+            exit 1
+        fi
+        verbose "Tool: $tool OK"
+    done
+
+    # Network check (best-effort)
+    if command -v curl &>/dev/null; then
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://github.com 2>/dev/null || echo "000")
+        if [[ "$http_code" != "200" && "$http_code" != "301" && "$http_code" != "302" ]]; then
+            warn "github.com may not be reachable (HTTP $http_code). Clone may fail."
+        else
+            verbose "Network: github.com reachable (HTTP $http_code)"
+        fi
+    fi
+
+    info "Prerequisites OK."
+}
+
+clone_openbmc() {
+    info "Step 2/8: Preparing OpenBMC main repository..."
+
+    if [[ -d "$OPENBMC_DIR/.git" ]]; then
+        warn "Main repository already exists at $OPENBMC_DIR"
+        warn "Skipping clone. To update, run: cd $OPENBMC_DIR && git pull"
+        return 0
+    fi
+
+    info "Cloning https://github.com/openbmc/openbmc.git -> $OPENBMC_DIR"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would run: git clone https://github.com/openbmc/openbmc.git $OPENBMC_DIR"
+        return 0
+    fi
+
+    mkdir -p "$WORKSPACE_DIR"
+    if ! git clone https://github.com/openbmc/openbmc.git "$OPENBMC_DIR"; then
+        error "Failed to clone openbmc main repository."
+        exit 1
+    fi
+    info "Main repository cloned successfully."
+}
+
+init_bitbake_env() {
+    info "Step 3/8: Initializing bitbake environment for machine=$MACHINE..."
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would run: cd $OPENBMC_DIR && source oe-init-build-env $BUILD_DIR"
+        info "[DRY-RUN] Would set MACHINE=\"$MACHINE\" in local.conf"
+        return 0
+    fi
+
+    cd "$OPENBMC_DIR"
+
+    # Source oe-init-build-env with a dedicated build directory
+    # shellcheck disable=SC1091
+    source oe-init-build-env "$BUILD_DIR"
+
+    # Set MACHINE in local.conf
+    local conf_dir="$BUILD_DIR/conf"
+    local local_conf="$conf_dir/local.conf"
+
+    mkdir -p "$conf_dir"
+
+    if [[ ! -f "$local_conf" ]]; then
+        error "local.conf not found after oe-init-build-env. Something went wrong."
+        exit 1
+    fi
+
+    # Backup local.conf
+    cp "$local_conf" "${local_conf}.bak.$(date +%Y%m%d%H%M%S)"
+
+    # Check if MACHINE is already set correctly
+    if grep -q "^MACHINE\s*??=" "$local_conf"; then
+        # Replace the default MACHINE line
+        sed -i "s/^MACHINE\s*??=.*/MACHINE ??= \"$MACHINE\"/" "$local_conf"
+    elif grep -q "^MACHINE\s*=" "$local_conf"; then
+        warn "MACHINE already set in local.conf. Updating to $MACHINE."
+        sed -i "s/^MACHINE\s*=.*/MACHINE = \"$MACHINE\"/" "$local_conf"
+    else
+        echo "" >> "$local_conf"
+        echo "MACHINE = \"$MACHINE\"" >> "$local_conf"
+    fi
+
+    info "Bitbake environment initialized. Build dir: $BUILD_DIR"
+}
+
+generate_dep_graph() {
+    info "Step 4/8: Generating dependency graph..."
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would run: bitbake -g obmc-phosphor-image"
+        info "[DRY-RUN] Would run: bitbake -e > $BUILD_DIR/bitbake-e-output"
+        info "[DRY-RUN] Would run: python3 $HARNESS_ROOT/tools/parse_bitbake_deps.py ..."
+        return 0
+    fi
+
+    cd "$OPENBMC_DIR"
+    # shellcheck disable=SC1091
+    source oe-init-build-env "$BUILD_DIR"
+
+    # Generate dependency graph
+    info "Running bitbake -g obmc-phosphor-image (this may take a while)..."
+    if ! bitbake -g obmc-phosphor-image; then
+        error "bitbake -g failed. Check machine name and bitbake environment."
+        exit 1
+    fi
+
+    # Save bitbake environment
+    bitbake -e > "$BUILD_DIR/bitbake-e-output"
+
+    # Parse dependencies
+    local deps_json="$BUILD_DIR/deps.json"
+    info "Parsing dependency graph..."
+    if ! python3 "$HARNESS_ROOT/tools/parse_bitbake_deps.py" \
+        --pn-buildlist "$BUILD_DIR/pn-buildlist" \
+        --bitbake-env "$BUILD_DIR/bitbake-e-output" \
+        --machine "$MACHINE" \
+        > "$deps_json"; then
+        error "Failed to parse bitbake dependency graph."
+        exit 1
+    fi
+
+    local dep_count
+    dep_count=$(python3 -c "import json; print(len(json.load(open('$deps_json'))))")
+    info "Found $dep_count git-based sub-repositories."
+}
+
+clone_sub_repos() {
+    info "Step 5/8: Cloning sub-repositories..."
+
+    local deps_json="$BUILD_DIR/deps.json"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would clone/fetch repositories listed in $deps_json"
+        return 0
+    fi
+
+    if [[ ! -f "$deps_json" ]]; then
+        error "deps.json not found. Previous step may have failed."
+        exit 1
+    fi
+
+    mkdir -p "$SRC_DIR"
+
+    # Read each repo from deps.json
+    local total failed=0
+    total=$(python3 -c "import json; print(len(json.load(open('$deps_json'))))")
+    local current=0
+
+    while IFS= read -r entry; do
+        current=$((current + 1))
+        local name src_uri srcrev clone_url
+        name=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+        src_uri=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['src_uri'])")
+        srcrev=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['srcrev'])")
+        clone_url=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['clone_url'])")
+
+        local local_path="$SRC_DIR/$name"
+        info "[$current/$total] Processing: $name"
+
+        if [[ "$SKIP_FETCH" -eq 1 ]] && [[ -d "$local_path" ]]; then
+            verbose "Skip fetch: $name already exists at $local_path"
+        elif [[ -d "$local_path/.git" ]]; then
+            verbose "Fetching updates for $name..."
+            if ! git -C "$local_path" fetch --all 2>/dev/null; then
+                warn "Failed to fetch $name, continuing with existing state."
+            fi
+        else
+            verbose "Cloning $clone_url -> $local_path"
+            if ! git clone "$clone_url" "$local_path" 2>/dev/null; then
+                error "Failed to clone $name from $clone_url"
+                STATUS_FAILED+=("$name (clone failed)")
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
+
+        # Checkout to specified commit
+        if [[ "$srcrev" != "\${AUTOREV}" && "$srcrev" != "AUTOINC" && -n "$srcrev" ]]; then
+            verbose "Checking out $name to $srcrev"
+            if ! git -C "$local_path" checkout "$srcrev" 2>/dev/null; then
+                # Try fetching all remotes first
+                warn "Commit $srcrev not found locally for $name, fetching..."
+                git -C "$local_path" fetch --all 2>/dev/null || true
+                if ! git -C "$local_path" checkout "$srcrev" 2>/dev/null; then
+                    warn "Could not checkout $name to $srcrev. Skipping."
+                    STATUS_FAILED+=("$name (checkout failed)")
+                    failed=$((failed + 1))
+                    continue
+                fi
+            fi
+        fi
+
+        STATUS_SUCCESS+=("$name")
+    done < <(python3 -c "
+import json, sys
+for item in json.load(open('$deps_json')):
+    json.dump(item, sys.stdout)
+    print()
+")
+
+    info "Sub-repos: ${#STATUS_SUCCESS[@]} succeeded, $failed failed."
+}
+
+generate_lockfile() {
+    info "Step 6/8: Generating lockfile..."
+
+    local lockfile="$CONFIGS_DIR/$MACHINE.lock"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would write lockfile to $lockfile"
+        return 0
+    fi
+
+    mkdir -p "$CONFIGS_DIR"
+
+    local openbmc_commit
+    openbmc_commit=$(git -C "$OPENBMC_DIR" rev-parse HEAD)
+
+    # Build lockfile JSON
+    python3 -c "
+import json, datetime
+deps = json.load(open('$BUILD_DIR/deps.json'))
+lockfile = {
+    'machine': '$MACHINE',
+    'generated_at': datetime.datetime.now().astimezone().isoformat(),
+    'openbmc_commit': '$openbmc_commit',
+    'target_image': 'obmc-phosphor-image',
+    'sub_repos': []
+}
+for dep in deps:
+    lockfile['sub_repos'].append({
+        'name': dep['name'],
+        'src_uri': dep['src_uri'],
+        'srcrev': dep['srcrev'],
+        'local_path': 'workspace/src/$MACHINE/' + dep['name'],
+        'recipe': dep['recipe']
+    })
+with open('$lockfile', 'w') as f:
+    json.dump(lockfile, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+"
+
+    info "Lockfile written to $lockfile"
+}
+
+inject_externalsrc() {
+    info "Step 7/8: Injecting externalsrc configuration..."
+
+    local conf_dir="$BUILD_DIR/conf"
+    local inc_file="$conf_dir/externalsrc-$MACHINE.inc"
+    local local_conf="$conf_dir/local.conf"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would generate $inc_file"
+        info "[DRY-RUN] Would add include to $local_conf"
+        return 0
+    fi
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Backup existing .inc file
+    if [[ -f "$inc_file" ]]; then
+        cp "$inc_file" "${inc_file}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+
+    # Generate .inc file
+    {
+        echo "# Auto-generated by ob init $MACHINE at $timestamp"
+        echo "# Do not edit manually. Re-run 'ob init $MACHINE' to regenerate."
+        echo ""
+
+        # Read deps to generate EXTERNALSRC lines
+        python3 -c "
+import json
+deps = json.load(open('$BUILD_DIR/deps.json'))
+for dep in deps:
+    name = dep['name']
+    recipe = dep['recipe']
+    local_path = '$SRC_DIR/' + name
+    print(f'EXTERNALSRC_pn-{recipe} = \"{local_path}\"')
+    print(f'EXTERNALSRC_BUILD_pn-{recipe} = \"{local_path}\"')
+    print()
+"
+    } > "$inc_file"
+
+    info "Generated $inc_file"
+
+    # Add include to local.conf if not already present
+    local include_line="include externalsrc-$MACHINE.inc"
+
+    if grep -qF "$include_line" "$local_conf"; then
+        verbose "Include line already exists in local.conf, skipping."
+    else
+        # Backup local.conf
+        cp "$local_conf" "${local_conf}.bak.$(date +%Y%m%d%H%M%S)"
+        echo "" >> "$local_conf"
+        echo "$include_line" >> "$local_conf"
+        info "Added '$include_line' to local.conf"
+    fi
+}
+
+print_report() {
+    info "Step 8/8: Status Report"
+    echo "============================================"
+    echo "Machine:    $MACHINE"
+    echo "Main repo:  $OPENBMC_DIR"
+    echo "Build dir:  $BUILD_DIR"
+    echo "Source dir: $SRC_DIR"
+    echo "Lockfile:   $CONFIGS_DIR/$MACHINE.lock"
+    echo "Ext. conf:  $BUILD_DIR/conf/externalsrc-$MACHINE.inc"
+    echo ""
+    echo "Sub-repos cloned: ${#STATUS_SUCCESS[@]}"
+    for name in "${STATUS_SUCCESS[@]}"; do
+        echo "  [OK] $name"
+    done
+    echo ""
+    echo "Sub-repos failed: ${#STATUS_FAILED[@]}"
+    for entry in "${STATUS_FAILED[@]}"; do
+        echo "  [FAIL] $entry"
+    done
+    echo "============================================"
+    echo ""
+    info "Next steps:"
+    echo "  cd $OPENBMC_DIR"
+    echo "  source oe-init-build-env build/$MACHINE"
+    echo "  bitbake obmc-phosphor-image"
+}
+
+# === Main ===
+main() {
+    parse_args "$@"
+    detect_harness_root
+    prerequisites_check
+    clone_openbmc
+    init_bitbake_env
+    generate_dep_graph
+    clone_sub_repos
+    generate_lockfile
+    inject_externalsrc
+    print_report
+}
+
+main "$@"
