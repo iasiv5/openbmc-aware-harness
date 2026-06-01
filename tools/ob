@@ -58,6 +58,12 @@ parse_args() {
         exit 1
     fi
 
+    # Handle global --help/-h before dispatching to subcommands
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+
     local command="$1"
     shift
 
