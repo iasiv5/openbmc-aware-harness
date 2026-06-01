@@ -256,8 +256,8 @@ def test_run_hook_dialog_spec_uses_text_surface_when_popup_disabled(
     assert dialog_spec["surface"] == "text"
     assert dialog_spec.get("options", []) == []
     assert "/ai-heartbeat" in dialog_spec["question"]
-    assert "运行 /ai-heartbeat：补记今天的新变化，整理近期记忆" in dialog_spec["question"]
-    assert "作用：让后续协作与 agent 接续更稳" in dialog_spec["question"]
+    assert "【推荐】在当前会话窗口运行 /ai-heartbeat 命令" in dialog_spec["question"]
+    assert "【作用】补记今天的新变化，整理近期记忆。" in dialog_spec["question"]
 
 
 def test_run_hook_dialog_spec_falls_back_to_modal_surface_when_policy_is_invalid(
