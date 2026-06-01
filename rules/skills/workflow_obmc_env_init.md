@@ -101,9 +101,8 @@ EXTERNALSRC_BUILD_pn-<recipe> = "<absolute-path-to-local-source>"
 
 ## 已知陷阱
 
-> 目前是初版，尚未积累真实踩坑记录。以下位置留给实际运行后发现的问题。
->
-> 当以下情况真实发生后，在此补充：网络超时导致的不完整 clone、特定 machine 的 bitbake 解析失败、externalsrc 路径在某些 bitbake 版本下的已知 bug 等。
+- **重跑前不要清空 `workspace/src/<machine>/`**：`tools/ob` 的子仓库阶段是增量的，已有 `.git` 的仓库会走 fetch/skip 路径。网络中断或少量仓库失败时，只删除明确失败的子仓库目录再重跑；清空整个 `workspace/src/<machine>/` 会丢失已下载的大量源码，重新 clone 可能耗费数小时。
+- **失败目录要按实际失败列表处理**：优先根据 `tools/ob` 的最终报告或当前 clone 失败输出定位目录，例如只处理 `workspace/src/romulus/linux` 这类失败仓库，不要把成功仓库当成临时产物清理。
 
 ---
 

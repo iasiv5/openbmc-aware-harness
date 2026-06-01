@@ -37,3 +37,8 @@ grep -A 20 "Date: $(date -v-7d +%Y-%m-%d)" contexts/memory/OBSERVATIONS.md
 ---
 
 <!-- 以下是记录区域，由 AI Heartbeat 本地执行器追加与整理 -->
+
+Date: 2026-06-01
+
+🟡 Medium: [ob init 工具状态] `ob init <machine>` 的设计、计划和主脚本已经落地到 `docs/specs/2026-05-31-obmc-env-init-design.md`、`docs/plans/2026-05-31-obmc-env-init-implementation-plan.md`、`tools/ob` 与 `tools/parse_bitbake_deps.py`；当前实现覆盖主仓库准备、OpenBMC `source setup`、`bitbake -g`、逐 recipe `bitbake -e` 解析、子仓库 clone/fetch、lockfile 与 externalsrc 注入。
+🟡 Medium: [AI Heartbeat 执行边界] `periodic_jobs/ai_heartbeat/src/v0/heartbeat_preflight.py`、`heartbeat_state.py` 和 `heartbeat_status_cli.py` 已形成 due-task 判定与自动记账链；hook 只提醒，observer/reflector 必须由当前 chat 显式运行 `/ai-heartbeat` 并在完成后写回 success/skipped/failed。
