@@ -71,22 +71,23 @@ Test-Path workspace/.gitkeep
 
 ### Task 3: 创建 tools/parse_bitbake_deps.py
 
-**动作**：编写 Python 脚本，解析 `bitbake -g` 和 `bitbake -e` 的输出，提取每个 recipe 的 SRC_URI 和 SRCREV。
+**动作**：编写 Python 脚本，解析 `bitbake -g` 生成的 pn-buildlist，逐 recipe 调用 `bitbake -e <recipe>` 提取 SRC_URI 和 SRCREV。
 
 **涉及文件**：`tools/parse_bitbake_deps.py`（新建）
 
 **脚本职责**：
-1. 接收两个输入文件路径：`pn-buildlist`（bitbake -g 生成的 recipe 列表）和 `bitbake -e` 的输出文件
-2. 从 `bitbake -e` 输出中解析每个 recipe 的 `SRC_URI` 和 `SRCREV`
-3. 过滤掉非 git 源的 SRC_URI（只保留 `git://` 开头的）
-4. 从 git URL 中提取仓库名（如 `git://github.com/openbmc/linux` → `linux`）
-5. 输出 JSON 数组到 stdout，每个元素包含 `name`、`src_uri`、`srcrev`、`recipe`
+1. 接收 `pn-buildlist` 文件路径（bitbake -g 生成的 recipe 列表）和 `machine` 名称
+2. 对 pn-buildlist 中的每个 recipe，调用 `bitbake -e <recipe>` 通过 subprocess 获取该 recipe 的环境变量
+3. 通过 `query_recipe_env(recipe_name)` 函数运行 subprocess 并解析输出，提取 `SRC_URI` 和 `SRCREV`
+4. 过滤掉非 git 源的 SRC_URI（只保留 `git://` 开头的）
+5. 从 git URL 中提取仓库名（如 `git://github.com/openbmc/linux` → `linux`）
+6. 输出 JSON 数组到 stdout，每个元素包含 `name`、`src_uri`、`srcrev`、`recipe`、`clone_url`
+7. 在 stderr 上显示进度："Querying recipe N/total: <name>..."
 
 **接口定义**：
 ```bash
 python3 tools/parse_bitbake_deps.py \
   --pn-buildlist <path>/pn-buildlist \
-  --bitbake-env <path>/bitbake-e-output \
   --machine <machine>
 ```
 
@@ -97,7 +98,8 @@ python3 tools/parse_bitbake_deps.py \
     "name": "linux",
     "src_uri": "git://github.com/openbmc/linux;protocol=https;branch=dev-6.6",
     "srcrev": "def456...",
-    "recipe": "linux-obmc"
+    "recipe": "linux-obmc",
+    "clone_url": "https://github.com/openbmc/linux"
   }
 ]
 ```
@@ -184,19 +186,20 @@ main "$@"
 
 **Step 3 - init_bitbake_env()**：
 - `cd "$OPENBMC_DIR"`
-- `source oe-init-build-env "$BUILD_DIR"`（BUILD_DIR = `build/<machine>`）
-- 在 `$BUILD_DIR/conf/local.conf` 中设置 `MACHINE = "<machine>"`
-- 备份 local.conf 为 local.conf.bak.<timestamp>（首次创建时无原文件则跳过备份）
+- 使用 OpenBMC 官方 `source setup "$MACHINE" "$BUILD_DIR"` 初始化构建环境
+- `source setup` 自动处理 TEMPLATECONF、bblayers.conf、local.conf（含 MACHINE 设置和 phosphor 兼容性检查）
+- 需要 `set +u` 保护，因为 setup 内部引用未定义变量
+- 无需手动设置 MACHINE（setup 已处理）
+- 无需手动备份 local.conf（setup 首次创建全新文件）
 
 **Step 4 - generate_dep_graph()**：
-- `cd "$OPENBMC_DIR" && source oe-init-build-env "$BUILD_DIR"`
-- `bitbake -g obmc-phosphor-image`
-- `bitbake -e > "$BUILD_DIR/bitbake-e-output"` 保存完整环境变量
-- 调用 Python 脚本：
+- `cd "$OPENBMC_DIR"`，重新 `source setup "$MACHINE" "$BUILD_DIR"` 进入构建环境
+- `bitbake -g obmc-phosphor-image`（生成 pn-buildlist）
+- 不再执行全局 `bitbake -e` 输出到文件（`bitbake -e` 不带 recipe 名只输出全局变量，不含 per-recipe SRC_URI/SRCREV）
+- 调用 Python 脚本，由脚本内部逐 recipe 调用 `bitbake -e <recipe>`：
   ```bash
   python3 "$HARNESS_ROOT/tools/parse_bitbake_deps.py" \
     --pn-buildlist "$BUILD_DIR/pn-buildlist" \
-    --bitbake-env "$BUILD_DIR/bitbake-e-output" \
     --machine "$MACHINE" \
     > "$BUILD_DIR/deps.json"
   ```
@@ -218,8 +221,11 @@ main "$@"
 
 **Step 7 - inject_externalsrc()**：
 - 生成 `$BUILD_DIR/conf/externalsrc-<machine>.inc`
-- 内容：对每个 sub_repo 生成 EXTERNALSRC_pn-<recipe> 和 EXTERNALSRC_BUILD_pn-<recipe>
 - 文件头标注自动生成时间和 "Do not edit" 提示
+- 配置多 machine 共享的下载和构建缓存：
+  - `DL_DIR = "${TOPDIR}/../../../downloads"` → 指向 `workspace/downloads/`
+  - `SSTATE_DIR = "${TOPDIR}/../../../sstate-cache"` → 指向 `workspace/sstate-cache/`
+- 对每个 sub_repo 生成 EXTERNALSRC_pn-<recipe> 和 EXTERNALSRC_BUILD_pn-<recipe>
 - 在 local.conf 中检查是否已有 `include externalsrc-<machine>.inc`；没有则追加
 - 备份旧 .inc 文件为 .bak.<timestamp>（如存在）
 
