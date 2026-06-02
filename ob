@@ -28,6 +28,8 @@ STATUS_FAILED=()
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 log()   { echo -e "$*"; }
@@ -35,6 +37,14 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 verbose() { if [[ "$VERBOSE" -eq 1 ]]; then echo -e "[DEBUG] $*"; fi; }
+
+step_header() {
+    local sep
+    sep=$(printf '\u2500%.0s' {1..60})
+    echo -e "${CYAN}${sep}${NC}"
+    echo -e "  ${BOLD}${CYAN}$*${NC}"
+    echo -e "${CYAN}${sep}${NC}"
+}
 
 show_logo() {
     echo -e ""
@@ -69,7 +79,7 @@ Options:
   --skip-fetch          Skip git clone/fetch of sub-repos
   --dry-run             Print actions without executing
   --obmc-url <url>      Use a custom OpenBMC repository URL
-  --verbose             Verbose output
+  -v, --verbose         Verbose output
   -h, --help            Show this help
 
 Examples:
@@ -98,13 +108,13 @@ parse_args() {
 
     case "$COMMAND" in
         init)
-            if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
+            if [[ $# -gt 0 ]] && [[ "$1" != -* ]]; then
                 MACHINE="$1"
                 shift
             fi
             ;;
         status)
-            if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
+            if [[ $# -gt 0 ]] && [[ "$1" != -* ]]; then
                 MACHINE="$1"
                 shift
             fi
@@ -129,7 +139,7 @@ parse_args() {
                 OPENBMC_REPO_URL="$2"
                 shift 2
                 ;;
-            --verbose)     VERBOSE=1; shift ;;
+            -v|-V|--verbose)  VERBOSE=1; shift ;;
             -h|--help)     usage; exit 0 ;;
             *)             error "Unknown option: $1"; usage; exit 1 ;;
         esac
@@ -477,6 +487,8 @@ print_available_machines() {
 
 require_openbmc_repo() {
     if [[ -d "$OPENBMC_DIR/.git" ]]; then
+        step_header "Step 2/8: Preparing OpenBMC main repository..."
+        info "Main repository already exists at $OPENBMC_DIR — skipping clone."
         return 0
     fi
     info "No OpenBMC main repository found at $OPENBMC_DIR."
@@ -555,7 +567,7 @@ resolve_machine() {
 }
 
 prerequisites_check() {
-    info "Step 1/8: Checking prerequisites..."
+    step_header "Step 1/8: Checking prerequisites..."
 
     # OS check
     if [[ "$(uname -s)" != "Linux" ]]; then
@@ -598,14 +610,13 @@ prerequisites_check() {
 }
 
 clone_openbmc() {
-    info "Step 2/8: Preparing OpenBMC main repository..."
+    step_header "Step 2/8: Preparing OpenBMC main repository..."
 
     verify_source
 
     if [[ -d "$OPENBMC_DIR/.git" ]]; then
-        warn "Main repository already exists at $OPENBMC_DIR"
-        warn "Skipping clone. To update:"
-        warn "  cd $OPENBMC_DIR && git pull && git submodule update --init --recursive"
+        info "Main repository already exists at $OPENBMC_DIR — skipping clone."
+        info "To update manually: cd $OPENBMC_DIR && git pull"
         return 0
     fi
 
@@ -627,7 +638,7 @@ clone_openbmc() {
 }
 
 init_bitbake_env() {
-    info "Step 3/8: Initializing bitbake environment for machine=$MACHINE..."
+    step_header "Step 3/8: Initializing bitbake environment for machine=$MACHINE..."
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         info "[DRY-RUN] Would run: cd $OPENBMC_DIR && source setup $MACHINE $BUILD_DIR"
@@ -691,7 +702,7 @@ open('$inc_file', 'w').write(content)
 }
 
 generate_dep_graph() {
-    info "Step 4/8: Generating dependency graph..."
+    step_header "Step 4/8: Generating dependency graph..."
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         info "[DRY-RUN] Would run: bitbake -g obmc-phosphor-image"
@@ -740,7 +751,7 @@ clone_sub_repos() {
     #   DO NOT delete src/<machine>/ before re-running ob init.
     #   Only delete the specific failed repo dirs you want to retry.
     #   Deleting all repos wastes hours of download time.
-    info "Step 5/8: Cloning sub-repositories..."
+    step_header "Step 5/8: Cloning sub-repositories..."
 
     local deps_json="$BUILD_DIR/deps.json"
 
@@ -862,7 +873,7 @@ for item in json.load(open('$deps_json')):
 }
 
 generate_lockfile() {
-    info "Step 6/8: Generating lockfile..."
+    step_header "Step 6/8: Generating lockfile..."
 
     local lockfile="$CONFIGS_DIR/$MACHINE.lock"
 
@@ -908,7 +919,7 @@ with open('$lockfile', 'w') as f:
 }
 
 inject_externalsrc() {
-    info "Step 7/8: Injecting externalsrc configuration..."
+    step_header "Step 7/8: Injecting externalsrc configuration..."
 
     local conf_dir="$BUILD_DIR/conf"
     local inc_file="$conf_dir/externalsrc-$MACHINE.inc"
@@ -980,7 +991,7 @@ for dep in deps:
 }
 
 print_report() {
-    info "Step 8/8: Status Report"
+    step_header "Step 8/8: Status Report"
 
     local report_file="$CONFIGS_DIR/$MACHINE.report.txt"
 
