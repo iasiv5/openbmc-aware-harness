@@ -21,14 +21,22 @@
 - **降低依赖 Git**: 本项目根目录的git不包括所有文件，内部包含大量嵌套的独立 Git 仓库。基于 Git 的全局 Diff 往往无法覆盖所有子模块且逻辑碎片化。但是具体的子模块在确定理解git结构的前提下也可以使用git。
 - **推荐工具**: 优先使用系统级的 `find`, `ls` 工具进行扫描。例如：`find . -name "*.md" -type f -mtime -1`。
 
-### 2.2 Blog 内容识别
-- **路径**: `contexts/blog/content/`
-- **逻辑**: 绝不可仅凭文件变动列表（Git/Find）就判定为新内容。
-- **校验**: 必须读取 Markdown Header 中的 `Date` 字段。仅当 `Date` 为今天或当前观测区间时，才视为有效。忽略格式重排导致的旧文章误报。
+### 2.2 扫描路径表
 
-### 2.3 路径白名单与黑名单
-- **忽略**: `contexts/daily_records/` (机械重复性数据)。
-- **包含**: `contexts/life_record/` 及其子目录下的 `.csv` 文件。
+Observer 扫描以下路径，检测有意义的变更：
+
+| 扫描路径 | 扫描语义 |
+|----------|---------|
+| `docs/specs/` | 新设计文档 = 新功能在规划 |
+| `docs/plans/` | 新实施计划 = 功能在构建 |
+| `rules/` | 核心规则变动 = 系统进化 |
+| `rules/skills/` | 新增 skill = 新能力 |
+| `rules/axioms/` | 新增公理 = 认知更新 |
+| `ob` | 主工具脚本变更 |
+| `tools/` | 工具变更 |
+| `.claude/skills/` | 自定义 skill 变更 |
+
+**忽略**：`workspace/`（整体 gitignore，内容由 `ob init` 管理）、`.venv/`（Python 虚拟环境）、`__pycache__/`。
 
 ## 3. 记忆系统分级规范 (Memory Tiering System)
 

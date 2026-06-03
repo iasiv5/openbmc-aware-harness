@@ -72,7 +72,7 @@ Usage: ob <command> [options] [arguments]
 
 Commands:
   init   [<machine>]    One-click initialize OpenBMC dev environment
-  status [<machine>]    Show current OpenBMC source binding status
+  status                Show current OpenBMC source binding status
 
 Options:
   --dry-run             Print actions without executing
