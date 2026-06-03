@@ -1,11 +1,6 @@
----
-agent: agent
-description: 智能执行 AI Heartbeat 的 observer / reflector，并自动回写状态。
----
+# AI Heartbeat (Claude Code Entry)
 
-# AI Heartbeat (Copilot Entry)
-
-这是 VS Code Copilot 的 `/ai-heartbeat` slash command 入口。本文件只负责 OS 探测和引用执行合同。
+这是 Claude Code 的 `/ai-heartbeat` slash command 入口。本文件只负责 OS 探测和引用执行合同。
 
 ## OS 探测
 
