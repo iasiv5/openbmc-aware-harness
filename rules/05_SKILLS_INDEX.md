@@ -49,5 +49,5 @@
 ## Progressive Disclosure
 
 Skills 采用渐进式披露原则：
-- **SKILLS_INDEX.md** 提供概览，快速定位
+- **05_SKILLS_INDEX.md** 提供概览，快速定位
 - **具体 skill 文件** 包含完整的操作步骤和示例
