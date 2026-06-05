@@ -71,8 +71,8 @@ Observer 扫描以下路径，检测有意义的变更：
 - **操作文件**:
   1. **规则层 (L3)**: 直接根据最新观测到的有效规律、语言风格变化、以及长效约束，修改或更新 `rules/` 下的核心规则文件 (`SOUL.md`, `USER.md`, `COMMUNICATION.md`, `WORKSPACE.md`)，并在确有必要时更新或新建 `rules/skills/` 下的真实 skill 文档。
   2. **Skills 索引与新增规范**: 当晋升目标落在 `rules/skills/` 下的真实 skill 文档时，必须遵循以下规则：
-     - 新增或重写 skill 前，先读 `rules/skills/bestpractice_skill_writing.md`，按目标、验收标准、可用资源和输出规格定义 skill，不要把 skill 写成机械步骤清单。
-     - 文件命名建议采用 `<category>_<name>.md`，例如 `workflow_my_process.md`、`bestpractice_my_insight.md`。
+     - 新增或重写 skill 前，先读 `rules/skills/bestpractice_01-skill_writing.md`，按目标、验收标准、可用资源和输出规格定义 skill，不要把 skill 写成机械步骤清单。
+     - 文件命名建议采用 `<category>_<NN>-<name>.md`，例如 `workflow_01-my_process.md`、`bestpractice_01-my_insight.md`。
      - 修改或新增后，必须同步更新 `rules/05_SKILLS_INDEX.md`，确保后续 agent 能找到。
   3. **记忆层 (L1/L2)**: 重写 `contexts/memory/OBSERVATIONS.md`。执行垃圾回收，删除已被固化进 rules 的内容以及过期的 🟢 记录。
 - **职责**: 确保 `rules/` 始终代表系统的最新“进化状态”。

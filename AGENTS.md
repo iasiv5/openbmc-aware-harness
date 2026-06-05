@@ -24,7 +24,7 @@ Don't ask permission. Just do it.
 
 **重要：遇到"怎么做 X"时，先查 skill 再查系统工具。** 搜索顺序：(1) `rules/05_SKILLS_INDEX.md` → (2) 系统工具。
 
-**想添加新能力** → 参考 `rules/skills/bestpractice_skill_writing.md`，写完后更新 `rules/05_SKILLS_INDEX.md`
+**想添加新能力** → 参考 `rules/skills/bestpractice_01-skill_writing.md`，写完后更新 `rules/05_SKILLS_INDEX.md`
 
 ## Axioms（公理）
 
