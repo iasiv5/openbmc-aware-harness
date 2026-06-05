@@ -95,6 +95,7 @@ EXTERNALSRC_BUILD_pn-<recipe> = "<absolute-path-to-local-source>"
 - **前置工具**：git, python3
 - **网络**：首次运行需访问 github.com；`--skip-fetch` 可离线运行
 - **连通性探针**：`ob init` 会在 `local.conf` 注入 `CONNECTIVITY_CHECK_URIS = ""`，避免受限网络下被 `https://yoctoproject.org/connectivity.html` 的 sanity probe 误拦截；如需保留探针，可在运行前设置 `OB_CONNECTIVITY_CHECK_URIS=https://www.example.com/ ./ob init <machine>`
+- **git reference 自动回填**：第四步执行 `source setup <machine>` 后，`ob` 会检查 `workspace/openbmc/build/<machine>/conf/local.conf`。如果其中已有非空 `DL_DIR`，且 `OB_GIT_REFERENCE_DIR` 缺失或为空，就自动把该值回填到 `OB_GIT_REFERENCE_DIR`。你也可以手动设置 `OB_GIT_REFERENCE_DIR = "/path/to/download-cache"` 覆盖自动值。这个变量只影响第六步子仓库 clone/fetch 的 reference 选择，不会被第八步生成的 `externalsrc-<machine>.inc` 覆盖。
 - **磁盘空间**：≥ 30GB（主仓库 + 子仓库 + 编译输出）
 - **幂等性**：重复运行 `ob init <machine>` 是安全的——已存在的仓库不会重新 clone，配置文件会备份后覆盖
 - **不要手动编辑** externalsrc inc 文件，需要变更时重新运行 `ob init`

@@ -18,6 +18,7 @@ OPENBMC_REPO_URL=""
 SOURCE_LABEL=""
 VERBOSE=0
 DRY_RUN=0
+SKIP_DEPS=0
 STATUS_SUCCESS=()
 STATUS_SHALLOW=()
 STATUS_UNPINNED=()
@@ -36,6 +37,173 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 verbose() { if [[ "$VERBOSE" -eq 1 ]]; then echo -e "[DEBUG] $*"; fi; }
+
+trim_whitespace() {
+    local value="$1"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    echo "$value"
+}
+
+read_local_conf_var() {
+    local local_conf="$1"
+    local var_name="$2"
+
+    if [[ ! -f "$local_conf" ]]; then
+        return 1
+    fi
+
+    python3 - "$local_conf" "$var_name" <<'PY'
+import pathlib
+import re
+import sys
+
+local_conf = pathlib.Path(sys.argv[1])
+var_name = sys.argv[2]
+pattern = re.compile(rf'^\s*{re.escape(var_name)}\s*(?:\?\?=|\?=|:=|=)\s*(.*)$')
+value = None
+
+for raw_line in local_conf.read_text().splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        continue
+
+    match = pattern.match(raw_line)
+    if not match:
+        continue
+
+    candidate = match.group(1).strip()
+    if "#" in candidate:
+        candidate = candidate.split("#", 1)[0].rstrip()
+
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in ('"', "'"):
+        candidate = candidate[1:-1]
+
+    value = candidate
+
+if value is None:
+    sys.exit(1)
+
+print(value)
+PY
+}
+
+# Check whether a URL points to a private/internal host.
+# Mirrors parse_bitbake_deps.py _is_private_host() logic:
+#   1. BitBake variable reference  (${GIT_MIRROR_HOST}, etc.)
+#   2. RFC 1918 private IPs: 10.x.x.x, 172.16–31.x.x, 192.168.x.x
+#   3. Host derived from runtime init script (meta-*/git-mirror-url.sh)
+is_private_url() {
+    local url="$1"
+
+    # Extract host[:port] from common URL forms
+    local host_port
+    if [[ "$url" == git@* ]]; then
+        # git@host:path or git@host:path.git
+        host_port="${url#git@}"
+        host_port="${host_port%%:*}"
+    elif [[ "$url" == git://* ]]; then
+        host_port="${url#git://}"
+        host_port="${host_port%%/*}"
+    elif [[ "$url" == http://* || "$url" == https://* || "$url" == ssh://* ]]; then
+        host_port="${url#*://}"
+        host_port="${host_port%%/*}"
+        host_port="${host_port%%@*}"  # strip user@ prefix if any
+    else
+        return 1
+    fi
+
+    local host="${host_port%:*}"
+    [[ "$host" == "$host_port" ]] && host="$host_port"
+
+    # 1) BitBake variable reference (e.g. ${GIT_MIRROR_HOST})
+    if [[ "$host" == *'${'* ]]; then
+        return 0
+    fi
+
+    # 2) RFC 1918 private IP check (covers 10/8, 172.16-31/16, 192.168/16)
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        local o1 o2
+        IFS='.' read -r o1 o2 _ <<< "$host"
+        if (( o1 == 10 )) \
+            || (( o1 == 172 && o2 >= 16 && o2 <= 31 )) \
+            || (( o1 == 192 && o2 == 168 )); then
+            return 0
+        fi
+    fi
+
+    # 3) Runtime init-script host (meta-*/git-mirror-url.sh GIT_MIRROR_HOST)
+    local _rt_script=""
+    for _candidate in "$WORKSPACE_DIR/openbmc"/meta-*/git-mirror-url.sh \
+                      "$WORKSPACE_DIR/openbmc"/meta-*/github-gitlab-url.sh; do
+        if [[ -f "$_candidate" ]]; then _rt_script="$_candidate"; break; fi
+    done
+    if [[ -f "$_rt_script" ]]; then
+        local _rt_host
+        _rt_host=$(grep -oP '^(GITLAB_IP|GIT_MIRROR_HOST)=["'"'"']?\K[^"'"'"'\s]+' "$_rt_script" 2>/dev/null | head -1 || true)
+        if [[ -n "$_rt_host" && "$_rt_host" == "$host" ]]; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+resolve_git_reference_root() {
+    local local_conf="$BUILD_DIR/conf/local.conf"
+    local configured_dir=""
+
+    configured_dir=$(read_local_conf_var "$local_conf" "OB_GIT_REFERENCE_DIR" 2>/dev/null || true)
+    configured_dir=$(trim_whitespace "$configured_dir")
+
+    if [[ -z "$configured_dir" ]]; then
+        return 1
+    fi
+
+    if [[ -d "$configured_dir/git2" ]]; then
+        echo "$configured_dir/git2"
+        return 0
+    fi
+
+    if [[ -d "$configured_dir" ]]; then
+        echo "$configured_dir"
+        return 0
+    fi
+
+    warn "OB_GIT_REFERENCE_DIR points to a missing path: $configured_dir"
+    return 1
+}
+
+derive_bitbake_git_mirror_path() {
+    local reference_root="$1"
+    local src_uri="$2"
+
+    python3 - "$reference_root" "$src_uri" <<'PY'
+import pathlib
+import sys
+from urllib.parse import urlparse
+
+reference_root = pathlib.Path(sys.argv[1])
+src_uri = sys.argv[2].split(';', 1)[0].strip()
+
+if not src_uri:
+    sys.exit(1)
+
+parsed = urlparse(src_uri)
+host = parsed.netloc or parsed.path.split('/')[0]
+path = parsed.path if parsed.netloc else parsed.path[len(host):]
+
+if not host or not path:
+    sys.exit(1)
+
+gitsrcname = f"{host.replace(':', '.')}{path.replace('/', '.').replace('*', '.').replace(' ', '_').replace('(', '_').replace(')', '_')}"
+if gitsrcname.startswith('.'):
+    gitsrcname = gitsrcname[1:]
+
+print(reference_root / gitsrcname)
+PY
+}
 
 step_header() {
     local sep
@@ -60,7 +228,7 @@ show_logo() {
     echo -e "\033[38;2;195;180;240m     ██║  ██║ ██║  ██║ ██║  ██║ ██║ ╚████║ ███████╗ ███████║ ███████║ \033[0m"
     echo -e "\033[38;2;208;184;240m     ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝ ╚══════╝ ╚══════╝ ╚══════╝ \033[0m"
     echo    "    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-    echo -e "    ┃     OpenBMC Dev. Environment Initializer · \\033[38;2;255;210;80mob init\033[0m · 𝓲𝓪𝓼𝓲     ┃"
+    echo -e "    ┃     OpenBMC Dev Environment Initializer · \\033[38;2;255;210;80mob init\033[0m · 𝓲𝓪𝓼𝓲      ┃"
     echo    "    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
 }
 
@@ -125,7 +293,8 @@ parse_args() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -d|-D|--dry-run)  DRY_RUN=1; shift ;;
+            -d|-D|--dry-run)    DRY_RUN=1; shift ;;
+            -s|-S|--skip-deps)   SKIP_DEPS=1; shift ;;
             -u|-U|--url)
                 if [[ $# -lt 2 ]]; then
                     error "Missing value for --url"
@@ -226,6 +395,7 @@ EOF
 ensure_bootstrap_local_conf() {
     local local_conf="$BUILD_DIR/conf/local.conf"
     local connectivity_value="${OB_CONNECTIVITY_CHECK_URIS-}"
+    local bootstrap_output=""
 
     if [[ ! -f "$local_conf" ]]; then
         error "local.conf not found at $local_conf"
@@ -236,14 +406,16 @@ ensure_bootstrap_local_conf() {
         connectivity_value=${connectivity_value//\"/\\\"}
     fi
 
-    python3 - "$local_conf" "$connectivity_value" <<'PY'
+    bootstrap_output=$(python3 - "$local_conf" "$connectivity_value" <<'PY'
 import pathlib
+import re
 import sys
 
 local_conf = pathlib.Path(sys.argv[1])
 connectivity_value = sys.argv[2]
 managed_start = "# BEGIN ob init managed settings"
 managed_end = "# END ob init managed settings"
+assignment_pattern = re.compile(r'^\s*([A-Za-z0-9_]+)\s*(?:\?\?=|\?=|:=|=)\s*(.*)$')
 managed_block = [
     managed_start,
     "# Disable OE connectivity probes by default; github fetches already validate network reachability.",
@@ -251,8 +423,67 @@ managed_block = [
     managed_end,
 ]
 
+
+def parse_assignment(line):
+    match = assignment_pattern.match(line)
+    if not match:
+        return None, None
+
+    key = match.group(1)
+    value = match.group(2).strip()
+    if "#" in value:
+        value = value.split("#", 1)[0].rstrip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    return key, value
+
 content = local_conf.read_text()
 lines = content.splitlines()
+
+dl_dir_value = ""
+ob_git_reference_dir_value = None
+ob_git_reference_dir_line = None
+ob_git_reference_dir_action = None
+ob_git_reference_dir_log_value = ""
+ob_git_reference_dir_log_detail = ""
+
+for index, raw_line in enumerate(lines):
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+
+    key, value = parse_assignment(raw_line)
+    if key == "DL_DIR":
+        dl_dir_value = value
+    elif key == "OB_GIT_REFERENCE_DIR":
+        ob_git_reference_dir_value = value
+        ob_git_reference_dir_line = index
+
+if dl_dir_value:
+    ob_line = f'OB_GIT_REFERENCE_DIR = "{dl_dir_value}"'
+    if ob_git_reference_dir_value is None:
+        insertion_index = 0
+        for index, raw_line in enumerate(lines):
+            stripped = raw_line.strip()
+            if stripped and not stripped.startswith("#"):
+                key, _ = parse_assignment(raw_line)
+                if key == "DL_DIR":
+                    insertion_index = index + 1
+        lines.insert(insertion_index, ob_line)
+        ob_git_reference_dir_action = "added"
+        ob_git_reference_dir_log_value = dl_dir_value
+    elif ob_git_reference_dir_value == "" and ob_git_reference_dir_line is not None:
+        lines[ob_git_reference_dir_line] = ob_line
+        ob_git_reference_dir_action = "updated"
+        ob_git_reference_dir_log_value = dl_dir_value
+    elif ob_git_reference_dir_value:
+        ob_git_reference_dir_action = "preserved"
+        ob_git_reference_dir_log_value = ob_git_reference_dir_value
+        if ob_git_reference_dir_value != dl_dir_value:
+            ob_git_reference_dir_log_detail = dl_dir_value
+elif ob_git_reference_dir_value:
+    ob_git_reference_dir_action = "preserved"
+    ob_git_reference_dir_log_value = ob_git_reference_dir_value
 
 try:
     start = lines.index(managed_start)
@@ -264,7 +495,33 @@ except ValueError:
     lines.extend(managed_block)
 
 local_conf.write_text("\n".join(lines) + "\n")
+
+if ob_git_reference_dir_action:
+    print(
+        f"OB_GIT_REFERENCE_DIR\t{ob_git_reference_dir_action}\t"
+        f"{ob_git_reference_dir_log_value}\t{ob_git_reference_dir_log_detail}"
+    )
 PY
+)
+
+    if [[ -n "$bootstrap_output" ]]; then
+        local marker action value detail
+        IFS=$'\t' read -r marker action value detail <<< "$bootstrap_output"
+        if [[ "$marker" == "OB_GIT_REFERENCE_DIR" ]]; then
+            case "$action" in
+                added|updated)
+                    info "Auto-${action} OB_GIT_REFERENCE_DIR from DL_DIR: $value"
+                    ;;
+                preserved)
+                    if [[ -n "$detail" ]]; then
+                        info "Keeping existing OB_GIT_REFERENCE_DIR: $value (DL_DIR: $detail)"
+                    else
+                        info "Keeping existing OB_GIT_REFERENCE_DIR: $value"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
 
     verbose "Ensured ob init managed local.conf settings in $local_conf"
 }
@@ -679,6 +936,41 @@ clone_openbmc() {
     info "Main repository cloned successfully."
 }
 
+run_repo_init_script() {
+    local init_script="$OPENBMC_DIR/init_openbmc_repo.sh"
+
+    if [[ ! -f "$init_script" ]]; then
+        verbose "No init_openbmc_repo.sh found in $OPENBMC_DIR — skipping custom repo initialization."
+        return 0
+    fi
+
+    info "Detected init_openbmc_repo.sh — running custom repository initialization..."
+    info "  This script clones/pulls vendor sub-repos (meta-iasi, etc.)"
+    info "  Incremental-safe: existing repos are pulled, missing repos are cloned."
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would run: cd $OPENBMC_DIR && bash init_openbmc_repo.sh"
+        return 0
+    fi
+
+    # init_openbmc_repo.sh uses SCRIPT_DIR relative paths — must run from openbmc root.
+    # Wrap in 'if' so set -e does not propagate a non-zero exit from the init script.
+    local prev_dir="$PWD"
+    cd "$OPENBMC_DIR"
+
+    if bash init_openbmc_repo.sh; then
+        info "Custom repository initialization completed."
+    else
+        cd "$prev_dir"
+        error "init_openbmc_repo.sh failed — the OpenBMC repository is incomplete."
+        error "Please fix the errors above and re-run: cd $OPENBMC_DIR && bash init_openbmc_repo.sh"
+        error "Then re-run: ob init $MACHINE"
+        exit 1
+    fi
+
+    cd "$prev_dir"
+}
+
 init_bitbake_env() {
     step_header "Step 3/8: Initializing bitbake environment for machine=$MACHINE..."
 
@@ -750,7 +1042,7 @@ generate_dep_graph() {
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         info "[DRY-RUN] Would run: bitbake -g obmc-phosphor-image"
-        info "[DRY-RUN] Would run: python3 parse_bitbake_deps.py (per-recipe bitbake -e queries)"
+        info "[DRY-RUN] Would query recipe SRC_URI/SRCREV via Tinfoil API"
         return 0
     fi
 
@@ -764,22 +1056,24 @@ generate_dep_graph() {
     source setup "$MACHINE" "$BUILD_DIR" 2>/dev/null
     eval "$prev_opts"
 
-    # Generate dependency graph to get pn-buildlist
-    info "Running bitbake -g obmc-phosphor-image"
-    info "This step takes 5-10 minutes (bitbake -g + per-recipe metadata queries)..."
+    # Generate pn-buildlist via bitbake -g (~3 min).
+    # This gives us ~570 target-dependent recipes instead of ~4492 total.
+    info "Running bitbake -g obmc-phosphor-image (generates pn-buildlist)..."
+    info "This step takes 3-5 minutes..."
     if ! bitbake -g obmc-phosphor-image; then
         error "bitbake -g failed. Check machine name and bitbake environment."
         exit 1
     fi
 
-    # Parse dependencies: Python script queries bitbake -e per recipe.
+    # Parse dependencies via Tinfoil API (single process, ~45s).
+    # Uses pn-buildlist to only query ~570 target recipes.
     # Write to a temp file first, then atomically rename on success.
     # This prevents ctrl+C from leaving deps.json empty (shell `>` truncates immediately).
     local deps_json="$BUILD_DIR/deps.json"
     local deps_json_tmp="$BUILD_DIR/deps.json.tmp"
-    info "Parsing dependency graph (querying per-recipe SRC_URI/SRCREV)..."
+    info "Querying recipe metadata via Tinfoil API (~45s)..."
     if ! python3 "$HARNESS_ROOT/tools/parse_bitbake_deps.py" \
-        --pn-buildlist "$BUILD_DIR/pn-buildlist" \
+        --build-dir "$BUILD_DIR" \
         --machine "$MACHINE" \
         > "$deps_json_tmp"; then
         rm -f "$deps_json_tmp"
@@ -815,6 +1109,12 @@ clone_sub_repos() {
 
     mkdir -p "$SRC_DIR"
 
+    local reference_root=""
+    reference_root=$(resolve_git_reference_root 2>/dev/null || true)
+    if [[ -n "$reference_root" ]]; then
+        info "Step 5 git reference cache: $reference_root"
+    fi
+
     # Read each repo from deps.json
     local total failed=0
     total=$(python3 -c "import json; print(len(json.load(open('$deps_json'))))")
@@ -822,15 +1122,71 @@ clone_sub_repos() {
 
     while IFS= read -r entry; do
         current=$((current + 1))
-        local name srcrev clone_url branch
+        local name srcrev clone_url branch src_uri
         name=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
         srcrev=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['srcrev'])")
         clone_url=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin)['clone_url'])")
+        src_uri=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin).get('src_uri',''))")
         # Strip surrounding quotes from branch (bitbake may emit branch=\"main\")
         branch=$(echo "$entry" | python3 -c "import sys,json; print(json.load(sys.stdin).get('branch',''))" | tr -d '\"' | tr -d "'")
 
         local local_path="$SRC_DIR/$name"
         info "[$current/$total] Processing: $name"
+
+        # Expand any remaining ${VAR} references in clone_url.
+        # These come from BitBake variables (e.g. ${GITLAB_IP}) that weren't
+        # resolved during deps.json generation (e.g. variable not in config).
+        if [[ "$clone_url" == *'${'* ]]; then
+            # Prefer the same runtime host source used by init_openbmc_repo.sh:
+            #   1) meta-*/git-mirror-url.sh (after GIT_MIRROR_HOST rewrite)
+            #   2) workspace/openbmc/.git/config origin URL
+            #   3) build/conf/local.conf as a manual fallback
+            local _runtime_script=""
+            for _candidate in "$WORKSPACE_DIR/openbmc"/meta-*/git-mirror-url.sh \
+                              "$WORKSPACE_DIR/openbmc"/meta-*/github-gitlab-url.sh; do
+                if [[ -f "$_candidate" ]]; then _runtime_script="$_candidate"; break; fi
+            done
+            local _openbmc_git_config="$WORKSPACE_DIR/openbmc/.git/config"
+            local _local_conf="$BUILD_DIR/conf/local.conf"
+            # Extract all ${VAR} names from clone_url
+            local _var_names
+            _var_names=$(echo "$clone_url" | grep -oP '\$\{[A-Za-z_][A-Za-z0-9_]*\}' | sort -u)
+            for _vk in $_var_names; do
+                local _vn="${_vk#\$\{}"
+                _vn="${_vn%\}}"
+                local _vv=""
+
+                if [[ "$_vn" == "GITLAB_IP" || "$_vn" == "GIT_MIRROR_HOST" ]] && [[ -f "$_runtime_script" ]]; then
+                    _vv=$(grep -oP '^(GITLAB_IP|GIT_MIRROR_HOST)=["'"'"']?\K[^"'"'"'\s]+' "$_runtime_script" 2>/dev/null | head -1 || true)
+                fi
+
+                if [[ -z "$_vv" ]] && { [[ "$_vn" == "GITLAB_IP" || "$_vn" == "GIT_MIRROR_HOST" ]] ; } && [[ -f "$_openbmc_git_config" ]]; then
+                    local _remote_url=""
+                    _remote_url=$(grep -E '^[[:space:]]*url = (git@|https?)' "$_openbmc_git_config" 2>/dev/null | head -1 | awk '{print $3}')
+                    if [[ "$_remote_url" == git@* ]]; then
+                        _vv=$(echo "$_remote_url" | sed -E 's/^git@([^:]+):.*/\1/')
+                    elif [[ "$_remote_url" == http://* || "$_remote_url" == https://* ]]; then
+                        _vv=$(echo "$_remote_url" | sed -E 's#^https?://([^/:]+).*#\1#')
+                    fi
+                fi
+
+                if [[ -z "$_vv" && -f "$_local_conf" ]]; then
+                    _vv=$(grep -oP "^$_vn\s*[:?]?=\s*[\"']?\\K[^\"'\s#]+" "$_local_conf" 2>/dev/null | head -1 || true)
+                fi
+
+                if [[ -n "$_vv" ]]; then
+                    clone_url="${clone_url//$_vk/$_vv}"
+                    verbose "Expanded $_vk -> $_vv in clone_url"
+                fi
+            done
+            # If still unexpanded, warn and skip
+            if [[ "$clone_url" == *'${'* ]]; then
+                warn "Unresolved BitBake variable in clone_url for $name: $clone_url"
+                STATUS_FAILED+=("$name (unresolved variable in clone URL)")
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
 
         if [[ -d "$local_path/.git" ]]; then
             verbose "Fetching updates for $name..."
@@ -838,45 +1194,133 @@ clone_sub_repos() {
                 warn "Failed to fetch $name, continuing with existing state."
             fi
         else
-            # Build clone flags: use --single-branch when branch is known
-            local clone_flags=()
-            if [[ -n "$branch" ]]; then
-                clone_flags+=(--single-branch --branch "$branch")
+            # Determine local mirror (BitBake downloads cache)
+            local reference_repo=""
+            local local_mirror=""
+            if [[ -n "$reference_root" && -n "$src_uri" ]]; then
+                reference_repo=$(derive_bitbake_git_mirror_path "$reference_root" "$src_uri" 2>/dev/null || true)
+                if [[ -n "$reference_repo" && -d "$reference_repo" ]]; then
+                    local_mirror="$reference_repo"
+                fi
             fi
 
-            verbose "Cloning $clone_url -> $local_path"
-            if ! git clone "${clone_flags[@]}" "$clone_url" "$local_path" 2>/dev/null; then
-                # Retry 1: shallow clone (faster for large repos like linux, binutils)
-                warn "Full clone failed for $name, retrying with shallow clone..."
-                rm -rf "$local_path" 2>/dev/null
-                local shallow_flags=(--depth=1)
+            # --- Mode A: local mirror exists -> clone directly from it (zero network) ---
+            if [[ -n "$local_mirror" ]]; then
+                local mirror_clone_flags=(--no-local)
                 if [[ -n "$branch" ]]; then
-                    shallow_flags+=(--single-branch --branch "$branch")
+                    mirror_clone_flags+=(--single-branch --branch "$branch")
                 fi
-                if ! git clone "${shallow_flags[@]}" "$clone_url" "$local_path" 2>/dev/null; then
-                    # Retry 2: branch may not exist (e.g. fmt renamed master→main),
-                    # try shallow clone without --single-branch constraint
+                verbose "Cloning from LOCAL mirror: $local_mirror -> $local_path"
+                if git clone "${mirror_clone_flags[@]}" "$local_mirror" "$local_path" 2>/dev/null; then
+                    # Clone succeeded — checkout srcrev if specified
+                    if [[ -n "$srcrev" && "$srcrev" != "\${AUTOREV}" ]]; then
+                        git -C "$local_path" checkout "$srcrev" 2>/dev/null || true
+                    fi
+                    continue  # success, move to next repo
+                fi
+                warn "Local mirror clone failed for $name, falling back to remote..."
+                rm -rf "$local_path" 2>/dev/null
+            fi
+
+            # --- Mode B: no local mirror -> clone from remote ---
+            # Strategy:
+            #   Both internal & external repos -> full clone first (complete history
+            #   for shared DL_DIR reuse). Shallow clone as last-resort fallback.
+            local _clone_err="$BUILD_DIR/clone-errors.log"
+
+            # Increase http.postBuffer for large repos (default 1MB causes curl 18
+            # "transfer closed with outstanding read data remaining" on big packs
+            # like glibc). 512MB is safe for any single-pack transfer.
+            git config --global http.postBuffer 536870912
+
+            if is_private_url "$clone_url"; then
+                # ========== Internal repo: full clone first (fast on LAN) ==========
+                local full_flags=()
+                if [[ -n "$branch" ]]; then
+                    full_flags+=(--single-branch --branch "$branch")
+                fi
+                verbose "Full cloning (internal) $clone_url -> $local_path"
+                if ! git clone "${full_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
+                    rm -rf "$local_path" 2>/dev/null
+                    # Fallback: shallow clone
+                    warn "Full clone failed for $name, retrying shallow..."
+                    sleep 2
+                    local shallow_flags=(--depth=1)
                     if [[ -n "$branch" ]]; then
-                        warn "Branch '$branch' not found for $name, retrying without branch constraint..."
+                        shallow_flags+=(--single-branch --branch "$branch")
+                    fi
+                    if ! git clone "${shallow_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
                         rm -rf "$local_path" 2>/dev/null
-                        if ! git clone --depth=1 "$clone_url" "$local_path" 2>/dev/null; then
-                            error "Failed to clone $name from $clone_url"
-                            STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
-                            failed=$((failed + 1))
-                            continue
-                        fi
-                        warn "$name cloned shallow without branch constraint (full git history unavailable)"
-                        STATUS_SHALLOW+=("$name")
-                    else
                         error "Failed to clone $name from $clone_url"
+                        local _last_err
+                        _last_err=$(grep -iE 'fatal|error|could not' "$_clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
+                        if [[ -n "$_last_err" ]]; then
+                            error "  git: $_last_err"
+                        fi
                         STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
                         failed=$((failed + 1))
                         continue
                     fi
-                fi
-                # Retry 1 succeeded — check if repo is actually shallow
-                if git -C "$local_path" rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
                     STATUS_SHALLOW+=("$name")
+                fi
+            else
+                # ========== External repo: full clone first (complete for DL_DIR reuse) ==========
+                local full_flags=()
+                if [[ -n "$branch" ]]; then
+                    full_flags+=(--single-branch --branch "$branch")
+                fi
+                if [[ -n "$reference_repo" && -d "$reference_repo" ]]; then
+                    full_flags+=(--reference-if-able "$reference_repo")
+                fi
+                verbose "Full cloning (external) $clone_url -> $local_path"
+                if ! git clone "${full_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
+                    rm -rf "$local_path" 2>/dev/null
+                    # Fallback: shallow clone
+                    warn "Full clone failed for $name, retrying shallow..."
+                    sleep 2
+                    local shallow_flags=(--depth=1)
+                    if [[ -n "$branch" ]]; then
+                        shallow_flags+=(--single-branch --branch "$branch")
+                    fi
+                    if [[ -n "$reference_repo" && -d "$reference_repo" ]]; then
+                        shallow_flags+=(--reference-if-able "$reference_repo")
+                    fi
+                    if ! git clone "${shallow_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
+                        rm -rf "$local_path" 2>/dev/null
+                        # Last resort: shallow without branch constraint
+                        if [[ -n "$branch" ]]; then
+                            warn "Shallow clone with branch '$branch' failed for $name, retrying without branch constraint..."
+                            sleep 2
+                            local no_branch_flags=(--depth=1)
+                            if ! git clone "${no_branch_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
+                                rm -rf "$local_path" 2>/dev/null
+                                error "Failed to clone $name from $clone_url"
+                                local _last_err
+                                _last_err=$(grep -iE 'fatal|error|could not' "$_clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
+                                if [[ -n "$_last_err" ]]; then
+                                    error "  git: $_last_err"
+                                fi
+                                STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
+                                failed=$((failed + 1))
+                                continue
+                            else
+                                warn "$name cloned shallow without branch constraint (full git history unavailable)"
+                                STATUS_SHALLOW+=("$name")
+                            fi
+                        else
+                            error "Failed to clone $name from $clone_url"
+                            local _last_err
+                            _last_err=$(grep -iE 'fatal|error|could not' "$_clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
+                            if [[ -n "$_last_err" ]]; then
+                                error "  git: $_last_err"
+                            fi
+                            STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
+                            failed=$((failed + 1))
+                            continue
+                        fi
+                    else
+                        STATUS_SHALLOW+=("$name")
+                    fi
                 fi
             fi
         fi
@@ -893,8 +1337,18 @@ clone_sub_repos() {
         if [[ "$skip_checkout" -eq 0 ]]; then
             verbose "Checking out $name to $srcrev"
             if ! git -C "$local_path" checkout "$srcrev" 2>/dev/null; then
-                # Try fetching all remotes first
+                # Commit not in local history (common for --depth=1 shallow clones).
+                # Fetch strategies, lightest first:
+                #   1. Fetch the exact commit from origin (O(1) on most Git servers)
+                #   2. Unshallow to get full branch history
+                #   3. Fetch --all as final catch-all
                 warn "Commit $srcrev not found locally for $name, fetching..."
+                if git -C "$local_path" fetch origin "$srcrev" 2>/dev/null; then
+                    verbose "Fetched specific commit $srcrev for $name"
+                elif git -C "$local_path" rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+                    verbose "Fetching specific commit failed, unshallowing $name..."
+                    git -C "$local_path" fetch --unshallow 2>>"$_clone_err" || true
+                fi
                 git -C "$local_path" fetch --all 2>/dev/null || true
                 if ! git -C "$local_path" checkout "$srcrev" 2>/dev/null; then
                     warn "Could not checkout $name to $srcrev. Skipping."
@@ -905,6 +1359,11 @@ clone_sub_repos() {
             fi
         else
             verbose "Skipping checkout for $name (srcrev=$srcrev, using branch HEAD)"
+        fi
+
+        # Track shallow status (must be after checkout, which may unshallow)
+        if git -C "$local_path" rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+            STATUS_SHALLOW+=("$name")
         fi
 
         STATUS_SUCCESS+=("$name")
@@ -1130,8 +1589,17 @@ main() {
         return 0
     fi
 
+    # README Step 1/8: 前置检查。
     prerequisites_check
+
+    # README Step 2/8: 克隆主仓库。
+    # 首次运行时 clone 主仓；重跑时做 source 校验并复用已有仓库。
     require_openbmc_repo
+
+    # [OEM] Step 2 扩展动作：如当前主仓需要 vendor bootstrap，继续补齐其子目录。
+    run_repo_init_script
+
+    # README Step 3/8: 解析 machine。
     resolve_machine
 
     # Re-derive paths (machine may have changed via interactive resolve_machine)
@@ -1173,11 +1641,33 @@ main() {
         echo ""
     fi
 
+    # README Step 4/8: 初始化 bitbake。
     init_bitbake_env
-    generate_dep_graph
+
+    # README Step 5/8: 生成依赖图。
+    if [[ "$SKIP_DEPS" -eq 1 ]]; then
+        local deps_json="$BUILD_DIR/deps.json"
+        if [[ ! -f "$deps_json" ]]; then
+            error "--skip-deps requires an existing $deps_json. Run full init first."
+            exit 1
+        fi
+        local dep_count
+        dep_count=$(python3 -c "import json; print(len(json.load(open('$deps_json'))))")
+        warn "--skip-deps: reusing existing deps.json ($dep_count repos)"
+    else
+        generate_dep_graph
+    fi
+
+    # README Step 6/8: 拉取子仓库。
     clone_sub_repos
+
+    # README Step 7/8: 生成 lockfile。
     generate_lockfile
+
+    # README Step 8/8: 注入 externalsrc。
     inject_externalsrc
+
+    # 收尾：打印并落盘最终状态报告。
     print_report
 }
 

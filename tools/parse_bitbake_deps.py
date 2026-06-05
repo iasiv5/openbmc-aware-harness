@@ -24,6 +24,7 @@ Output: JSON array to stdout, one entry per git-based recipe.
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -113,31 +114,222 @@ def extract_repo_name(git_uri):
     return repo_name
 
 
-def convert_to_https_url(git_uri):
-    """
-    Convert a git:// URI to an https:// clone URL.
+def _to_ssh_url(host, path):
+    """Convert host + path to git@host:path SSH URL, stripping any port."""
+    if ":" in host:
+        host = host.split(":")[0]
+    return "git@" + host + ":" + path
 
-    git://github.com/openbmc/linux;protocol=https;branch=dev-6.6
-    -> https://github.com/openbmc/linux
+
+def _parse_git_uri_params(git_uri):
+    """Parse ``;key=value`` parameters from a BitBake git URI."""
+    params = {}
+    for param in git_uri.split(";")[1:]:
+        if "=" not in param:
+            continue
+        key, value = param.split("=", 1)
+        params[key] = value.strip('"').strip("'")
+    return params
+
+
+def _resolve_git_uri_srcrev(git_uri, default_srcrev, get_var):
+    """Resolve the revision that belongs to a single git URI entry."""
+    params = _parse_git_uri_params(git_uri)
+
+    # URI-local rev pin wins over recipe-wide SRCREV variables.
+    if params.get("rev"):
+        return params["rev"]
+
+    src_name = params.get("name")
+    if src_name:
+        named_srcrev = get_var("SRCREV_" + src_name)
+        if named_srcrev:
+            return named_srcrev
+
+    return default_srcrev
+
+
+def _detect_runtime_git_host():
+    """Detect the runtime Git host used by init_openbmc_repo.sh.
+
+    The init script copies ``meta-*/git-mirror-url.sh`` (or legacy
+    ``meta-*/github-gitlab-url.sh``), rewrites ``GIT_MIRROR_HOST=...`` based
+    on the current OpenBMC origin URL, and executes it. Reuse that same source
+    here so deps.json generation follows the same environment-specific host
+    choice.
     """
-    url_part = git_uri.split(";")[0]
+    cache = getattr(_detect_runtime_git_host, "_cache", None)
+    if cache is not None:
+        return cache
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    openbmc_root = os.path.join(repo_root, "workspace", "openbmc")
+
+    # Glob-discover the vendor mirror script (new name first, then legacy)
+    runtime_script = ""
+    for candidate in sorted(glob.glob(os.path.join(openbmc_root, "meta-*", "git-mirror-url.sh"))) \
+                  + sorted(glob.glob(os.path.join(openbmc_root, "meta-*", "github-gitlab-url.sh"))):
+        if os.path.isfile(candidate):
+            runtime_script = candidate
+            break
+
+    host = ""
+    if runtime_script:
+        pattern = re.compile(r'^(GITLAB_IP|GIT_MIRROR_HOST)=["\']?([^"\'\n]+)')
+        with open(runtime_script, "r", encoding="utf-8") as script_file:
+            for line in script_file:
+                match = pattern.match(line.strip())
+                if match:
+                    host = match.group(2).strip()
+                    break
+
+    if not host:
+        git_config = os.path.join(openbmc_root, ".git", "config")
+        if os.path.isfile(git_config):
+            with open(git_config, "r", encoding="utf-8") as config_file:
+                for raw_line in config_file:
+                    line = raw_line.strip()
+                    if not line.startswith("url = "):
+                        continue
+                    remote_url = line.split("=", 1)[1].strip()
+                    if remote_url.startswith("git@"):
+                        host = re.sub(r'^git@([^:]+):.*', r'\1', remote_url)
+                        break
+                    if remote_url.startswith(("http://", "https://")):
+                        host = re.sub(r'^https?://([^/:]+).*', r'\1', remote_url)
+                        break
+
+    _detect_runtime_git_host._cache = host
+    return host
+
+
+def _load_runtime_bb_vars():
+    """Load BitBake-style variables inferred from runtime init artifacts."""
+    host = _detect_runtime_git_host()
+    if not host:
+        return {}
+    return {"GIT_MIRROR_HOST": host}
+
+
+def _is_private_host(host_port):
+    """
+    Return True if host_port refers to a private/internal server.
+
+    Detection strategy (no hardcoded IPs or hostnames):
+
+    1. **BitBake variable reference**: ``${GIT_MIRROR_HOST}``, ``${SOME_VAR}``
+       — these always resolve to internal servers at runtime.
+    2. **RFC 1918 private IPs**: 10.x.x.x, 172.16–31.x.x, 192.168.x.x
+       — internal networks by definition.
+    3. **Runtime init-script derived hosts**: host discovered from
+       ``meta-*/git-mirror-url.sh`` or ``.git/config``.
+
+    This keeps the source code free of any internal IPs or hostnames.
+    """
+    # Strip port for host-only checks
+    host = host_port.split(":")[0] if ":" in host_port else host_port
+
+    # 1) BitBake variable reference (e.g. ${GIT_MIRROR_HOST})
+    if host.startswith("${") and host.endswith("}"):
+        return True
+
+    # 2) RFC 1918 private IP ranges
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_private:
+            return True
+    except ValueError:
+        pass  # not an IP → skip
+
+    # 3) Runtime/init-script derived hosts
+    runtime_host = _detect_runtime_git_host()
+    if runtime_host and (host_port == runtime_host or host == runtime_host):
+        return True
+
+    return False
+
+
+def derive_clone_url(git_uri):
+    """
+    Derive a clone-ready URL from a BitBake git URI.
+
+    Routing rules (private IPs / config-file hosts always use SSH):
+
+      git://<private-ip>:port/path;protocol=https  ->  git@<private-ip>:path
+      git://<config-host>/path;protocol=https       ->  git@<config-host>:path
+      git://github.com/...;protocol=https            ->  https://github.com/...
+      git://git.infradead.org/...                    ->  git://git.infradead.org/...
+      git://git@host/path                            ->  git@host:path (SSH shorthand)
+
+    The ``ob`` script's clone logic uses this URL only when the local
+    BitBake download mirror is NOT available.  When the mirror exists,
+    it clones directly from the local mirror (zero network, zero auth).
+    """
+    parts = git_uri.split(";")
+    url_part = parts[0]
+
+    # --- Extract protocol parameter ---
+    proto = ""
+    for param in parts[1:]:
+        if param.startswith("protocol="):
+            proto = param.split("=", 1)[1].strip('"').strip("'")
+            break
 
     if url_part.startswith("git://"):
         rest = url_part[6:]
-        # Handle malformed git://git@host/path -> host/path
+
+        # Handle malformed git://git@host/path -> git@host:path (SSH)
         if rest.startswith("git@"):
             rest = rest[4:].lstrip("/")
-        if ":" in rest and not rest.startswith("["):
-            # host:path format -> host/path
-            rest = rest.replace(":", "/", 1)
-        return "https://" + rest
+            if ":/" in rest:
+                host, path = rest.split(":/", 1)
+                return "git@" + host.rstrip(":") + ":" + path.lstrip("/")
+            first_slash = rest.find("/")
+            if first_slash > 0:
+                host = rest[:first_slash].rstrip(":")
+                return "git@" + host + ":" + rest[first_slash + 1:]
+            return "git@" + rest
+
+        # Split host[:port] and path
+        first_slash = rest.find("/")
+        if first_slash < 0:
+            # No path — shouldn't happen but handle gracefully
+            return "git://" + rest
+        host_port = rest[:first_slash]
+        path = rest[first_slash + 1:]
+
+        # --- Private/internal hosts: always use SSH (no auth needed) ---
+        if _is_private_host(host_port):
+            return _to_ssh_url(host_port, path)
+
+        # --- External hosts: respect protocol= parameter ---
+
+        # Handle host:path SSH shorthand (no numeric port)
+        if ":" in host_port and not host_port.startswith("["):
+            after_colon = host_port[host_port.index(":") + 1:]
+            if after_colon and not after_colon[0].isdigit():
+                # host:path -> rewrite to host/path
+                host_port = host_port.replace(":", "/", 1)
+                # recalculate rest after rewrite
+                rest = host_port + "/" + path
+
+        if proto == "https":
+            return "https://" + (rest if ":" not in host_port or host_port == url_part[6:6+len(host_port)] else host_port + "/" + path)
+        elif proto == "ssh":
+            return _to_ssh_url(host_port, path)
+        elif proto == "http":
+            return "http://" + (rest if ":" not in host_port else host_port + "/" + path)
+        elif proto and proto != "git":
+            return proto + "://" + (rest if ":" not in host_port else host_port + "/" + path)
+
+        # No protocol param or protocol=git — keep git:// as-is
+        # Rebuild full URL in case host_port was rewritten
+        return "git://" + host_port + "/" + path
     elif url_part.startswith("https://"):
         return url_part
     elif url_part.startswith("ssh://"):
-        rest = url_part[6:]
-        if rest.startswith("git@"):
-            rest = rest[4:]
-        return "https://" + rest
+        return url_part
     else:
         return url_part
 
@@ -158,7 +350,7 @@ def _build_result_entry(git_uri, srcrev, recipe):
         "src_uri": git_uri,
         "srcrev": srcrev if srcrev not in ("AUTOINC", "INVALID", "${AUTOREV}") else "${AUTOREV}",
         "recipe": recipe,
-        "clone_url": convert_to_https_url(git_uri),
+        "clone_url": derive_clone_url(git_uri),
         "branch": branch,
     }
 
@@ -166,15 +358,60 @@ def _build_result_entry(git_uri, srcrev, recipe):
 # === Tinfoil mode (fast, default) ===
 
 
-def _extract_git_deps(src_uri, srcrev, recipe, seen_repos, results):
+def _resolve_bb_vars(tinfoil, text):
+    """Resolve ${VAR} references in text using BitBake's config data store.
+
+    Variables like GIT_MIRROR_HOST are defined in local.conf or bbclass files but
+    are NOT expanded by d.getVar("SRC_URI") because they appear as literal
+    strings inside the URI value. This function finds all ${VAR} patterns
+    and resolves them from the global config data store.
+    """
+    if "${" not in text:
+        return text
+
+    # BitBake can preserve unresolved variables as escaped strings like
+    # ``\${GIT_MIRROR_HOST}``. Normalize those first so replacement does not leave
+    # a stray leading backslash in the host portion.
+    text = text.replace(r"\${", "${")
+
+    var_pattern = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
+    runtime_vars = _load_runtime_bb_vars()
+
+    def _replacer(m):
+        var_name = m.group(1)
+        # 1. Try BitBake config data store
+        try:
+            val = tinfoil.config_data.getVar(var_name)
+            if val:
+                return val
+        except Exception:
+            pass
+        # 2. Runtime fallback: same host discovered by init_openbmc_repo.sh
+        if var_name in runtime_vars:
+            return runtime_vars[var_name]
+        return m.group(0)  # keep unresolved as-is
+
+    return var_pattern.sub(_replacer, text)
+
+
+def _extract_git_deps(src_uri, srcrev, recipe, seen_repos, results, get_var=None):
     """Extract git-based deps from a recipe's SRC_URI, dedup by repo name."""
+    if get_var is None:
+        get_var = lambda _name: ""
+
     git_uris = extract_git_srcuris(src_uri)
     for git_uri in git_uris:
         repo_name = extract_repo_name(git_uri)
         if repo_name in seen_repos:
             continue
         seen_repos.add(repo_name)
-        results.append(_build_result_entry(git_uri, srcrev, recipe))
+        results.append(
+            _build_result_entry(
+                git_uri,
+                _resolve_git_uri_srcrev(git_uri, srcrev, get_var),
+                recipe,
+            )
+        )
 
 
 def query_deps_tinfoil(build_dir):
@@ -259,10 +496,14 @@ def query_deps_tinfoil(build_dir):
                     if d is None:
                         errors += 1
                         continue
+                    src_uri = _resolve_bb_vars(
+                        tinfoil, d.getVar("SRC_URI") or ""
+                    )
                     _extract_git_deps(
-                        d.getVar("SRC_URI") or "",
+                        src_uri,
                         d.getVar("SRCREV") or "",
                         pn, seen_repos, results,
+                        get_var=lambda var_name, data=d: data.getVar(var_name) or "",
                     )
             else:
                 # Mode B: enumerate all_recipes(), skip native/sdk/cross variants
@@ -294,10 +535,14 @@ def query_deps_tinfoil(build_dir):
                     if d is None:
                         errors += 1
                         continue
+                    src_uri = _resolve_bb_vars(
+                        tinfoil, d.getVar("SRC_URI") or ""
+                    )
                     _extract_git_deps(
-                        d.getVar("SRC_URI") or "",
+                        src_uri,
                         d.getVar("SRCREV") or "",
                         pn, seen_repos, results,
+                        get_var=lambda var_name, data=d: data.getVar(var_name) or "",
                     )
     finally:
         sys.stdout = real_stdout
@@ -320,7 +565,7 @@ def query_recipe_env(recipe_name):
     """
     Run `bitbake -e <recipe>` and extract SRC_URI and SRCREV.
 
-    Returns dict with keys 'SRC_URI' and 'SRCREV', or empty dict on failure.
+    Returns dict with keys 'SRC_URI', 'SRCREV', and 'vars', or empty dict on failure.
     """
     try:
         result = subprocess.run(
@@ -337,6 +582,7 @@ def query_recipe_env(recipe_name):
 
     src_uri = ""
     srcrev = ""
+    vars_map = {}
 
     for line in result.stdout.splitlines():
         # bitbake -e outputs VAR="value" lines for final variable values
@@ -344,15 +590,17 @@ def query_recipe_env(recipe_name):
             m = re.match(r'^SRC_URI="(.*)"$', line)
             if m:
                 src_uri = m.group(1).strip()
-        elif line.startswith("SRCREV="):
-            m = re.match(r'^SRCREV="(.*)"$', line)
+        elif line.startswith("SRCREV"):
+            m = re.match(r'^(SRCREV(?:_[^=]+)?)="(.*)"$', line)
             if m:
-                srcrev = m.group(1).strip()
+                vars_map[m.group(1)] = m.group(2).strip()
+
+    srcrev = vars_map.get("SRCREV", "")
 
     if not src_uri:
         return {}
 
-    return {"SRC_URI": src_uri, "SRCREV": srcrev}
+    return {"SRC_URI": src_uri, "SRCREV": srcrev, "vars": vars_map}
 
 
 def query_deps_legacy(pn_buildlist_path):
@@ -378,8 +626,16 @@ def query_deps_legacy(pn_buildlist_path):
         recipe_info = query_recipe_env(recipe)
         src_uri = recipe_info.get("SRC_URI", "")
         srcrev = recipe_info.get("SRCREV", "AUTOINC")
+        vars_map = recipe_info.get("vars", {})
 
-        _extract_git_deps(src_uri, srcrev, recipe, seen_repos, results)
+        _extract_git_deps(
+            src_uri,
+            srcrev,
+            recipe,
+            seen_repos,
+            results,
+            get_var=lambda var_name, data=vars_map: data.get(var_name, ""),
+        )
 
     print("", file=sys.stderr)  # newline after progress
     return results
