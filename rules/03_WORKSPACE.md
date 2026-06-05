@@ -16,6 +16,7 @@
 - AI Heartbeat 心跳子系统（PRD、源码、测试、配置）：`periodic_jobs/ai_heartbeat/`
 - GitHub Copilot 入口与 hooks：`.github/`
 - GitHub Copilot/Claude Code 仓库级自定义 skills：`.claude/skills/`
+- Claude Code 仓库级自定义命令：`.claude/commands/`（如 `/ai-heartbeat` 入口）
 - 设计文档：`docs/specs/`（通过 `/brainstorming` skill 触发后自动落盘）
 - 实施计划：`docs/plans/`（通过 `/writing-plans` skill 触发后自动落盘）
 

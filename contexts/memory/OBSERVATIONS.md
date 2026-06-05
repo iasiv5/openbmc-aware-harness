@@ -49,3 +49,11 @@ Date: 2026-06-03
 🟡 Medium: [rules 体系精简] 入口文件加数字前缀（`01_SOUL.md`~`06_AXIOMS_INDEX.md`）统一加载顺序；axioms/skills INDEX 提升至 `rules/` 层；删除 5 个低价值 skill（multi_agent_analysis、product_decision_analysis、staged_approach、parallel_subagents、ai_agent_cli_guide），净减 895 行。
 🟡 Medium: [文档清理] README 重写为人类使用手册（克隆→初始化→构建全流程）；内部文档做事实修正（路由表补齐、幽灵路径替换）；新增 `docs/specs/2026-06-03-doc-audit-cleanup-design.md` 和对应实施计划。
 🟢 Low: [ob UX 改进] 新增启动 logo、步骤标题函数、连通性探针说明；源选择菜单加序号及 `--obmc-url` 命令提示；下载提示分层重构。
+
+Date: 2026-06-05
+
+🔴 High: [Tinfoil 替代 N+1 查询模式] `tools/parse_bitbake_deps.py` 用 BitBake Tinfoil API（单进程）替代逐 recipe `bitbake -e` 子进程调用，SRC_URI/SRCREV 查询耗时从 ~17 min 降至 ~3.5 min（5x 提速）；关键设计决策：保留 `bitbake -g` 生成 `pn-buildlist`（~569 个 build target），Tinfoil 仅查询该列表而非 `all_recipes()`（~4492 个），避免引入 8x 噪音。
+🟡 Medium: [ob init 本地镜像加速] `ob` 脚本新增 git reference/mirror 智能路由：读取 `local.conf` 的 `OB_GIT_REFERENCE_DIR`，自动检测 BitBake mirror 路径（`gitsrcname` 命名），clone 时 `--reference-if-able` 利用本地已有对象；新增 `is_private_url()` 检测私有/内网 URL（RFC 1918 + BitBake 变量引用 + runtime init script），用于智能路由 clone URL。
+🟡 Medium: [AI Heartbeat SOP 抽离] 执行合同从平台入口文件剥离为独立 `periodic_jobs/ai_heartbeat/docs/AI_HEARTBEAT_SOP.md`；新增 Claude Code 入口 `.claude/commands/ai-heartbeat.md`，实现跨平台（PowerShell/Bash）统一调用路径。
+🟡 Medium: [ob 命令行简化] `ob` 脚本选项统一为短格式（`-m`/`-u`/`-v`/`-n`/`-s`），`--skip-deps` 降级为隐性应急选项不再暴露在 `--help`。
+🟢 Low: [文档新增] 新增设计文档 `docs/specs/2026-06-04-tinfoil-deps-optimization-design.md` 和实施计划 `docs/plans/2026-06-04-tinfoil-deps-optimization-implementation-plan.md`。

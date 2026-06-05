@@ -5,7 +5,7 @@
 - **类型**: Workflow
 - **适用场景**: 初始化 OpenBMC 本地开发环境（clone 子仓库、注入 externalsrc、生成 lockfile）
 - **创建日期**: 2026-05-31
-- **最后更新**: 2026-06-02
+- **最后更新**: 2026-06-05
 
 ---
 
@@ -47,16 +47,17 @@
 
 **工具**：
 - 根目录 `ob` — 主入口 bash 脚本，编排 8 阶段流程（前置检查 → clone → 校验 machine → init → 依赖图 → 子仓库 → lockfile → externalsrc → 报告）
-- `tools/parse_bitbake_deps.py` — Python 脚本，解析 `bitbake -g` 和 `bitbake -e` 输出为 JSON
+- `tools/parse_bitbake_deps.py` — Python 脚本，用 BitBake Tinfoil API 批量查询 SRC_URI/SRCREV（替代逐 recipe `bitbake -e`），从 `pn-buildlist` 读取 recipe 列表，~5x 性能提升
 
 **命令行选项**：
 
 ```bash
 ./ob init                          # 列出可用 machine 并交互选择
 ./ob init <machine>              # 基本用法
-./ob init <machine> --dry-run    # 预览模式，不实际执行
-./ob init <machine> --skip-fetch # 跳过 git clone/fetch
-./ob init <machine> --verbose    # 详细输出
+./ob init <machine> -n            # 预览模式（dry-run），不实际执行
+./ob init <machine> -s            # 跳过依赖解析（skip-deps，应急选项）
+./ob init <machine> -v            # 详细输出
+./ob init -m <machine> -u <url>  # 指定 machine 和 OpenBMC 仓库 URL
 ```
 
 **锁文件 schema**（`workspace/configs/<machine>.lock`）：
