@@ -17,8 +17,8 @@
 - GitHub Copilot 入口与 hooks：`.github/`
 - GitHub Copilot/Claude Code 仓库级自定义 skills：`.claude/skills/`
 - Claude Code 仓库级自定义命令：`.claude/commands/`（如 `/ai-heartbeat` 入口）
-- 设计文档：`docs/specs/`（通过 `/brainstorming` skill 触发后自动落盘）
-- 实施计划：`docs/plans/`（通过 `/writing-plans` skill 触发后自动落盘）
+- 设计文档：`docs/specs/`（通过 `/brainstorming` skill 触发后自动落盘；已批准的文档为冻结快照，一般不修改）
+- 实施计划：`docs/plans/`（通过 `/writing-plans` skill 触发后自动落盘；已完成的文档为冻结快照，一般不修改）
 
 ## 命名规则
 - 目录和文件名：小写 + 下划线 (snake_case)
