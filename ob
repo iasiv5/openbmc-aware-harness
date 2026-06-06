@@ -23,6 +23,9 @@ STATUS_SUCCESS=()
 STATUS_SHALLOW=()
 STATUS_UNPINNED=()
 STATUS_FAILED=()
+STATUS_MIRROR_NEW=()
+STATUS_MIRROR_EXISTING=()
+MIRROR_BASE=""
 
 # === Colors ===
 RED='\033[0;31m'
@@ -150,29 +153,31 @@ is_private_url() {
     return 1
 }
 
-resolve_git_reference_root() {
+resolve_effective_dl_dir() {
     local local_conf="$BUILD_DIR/conf/local.conf"
-    local configured_dir=""
+    local default_dl_dir="$WORKSPACE_DIR/downloads"
+    local dl_dir=""
 
-    configured_dir=$(read_local_conf_var "$local_conf" "OB_GIT_REFERENCE_DIR" 2>/dev/null || true)
-    configured_dir=$(trim_whitespace "$configured_dir")
+    # 1. Try reading DL_DIR from local.conf
+    dl_dir=$(read_local_conf_var "$local_conf" "DL_DIR" 2>/dev/null || true)
+    dl_dir=$(trim_whitespace "$dl_dir")
 
-    if [[ -z "$configured_dir" ]]; then
-        return 1
+    # 2. Fall back to harness default if not configured
+    if [[ -z "$dl_dir" ]]; then
+        dl_dir="$default_dl_dir"
     fi
 
-    if [[ -d "$configured_dir/git2" ]]; then
-        echo "$configured_dir/git2"
-        return 0
+    # 3. Writability check — fallback to workspace/downloads/ if not writable
+    mkdir -p "$dl_dir" 2>/dev/null
+    if ! touch "$dl_dir/.ob-init-writable-test" 2>/dev/null; then
+        warn "DL_DIR not writable: $dl_dir — falling back to $default_dl_dir"
+        dl_dir="$default_dl_dir"
+        mkdir -p "$dl_dir"
+    else
+        rm -f "$dl_dir/.ob-init-writable-test"
     fi
 
-    if [[ -d "$configured_dir" ]]; then
-        echo "$configured_dir"
-        return 0
-    fi
-
-    warn "OB_GIT_REFERENCE_DIR points to a missing path: $configured_dir"
-    return 1
+    echo "$dl_dir"
 }
 
 derive_bitbake_git_mirror_path() {
@@ -479,11 +484,6 @@ content = local_conf.read_text()
 lines = content.splitlines()
 
 dl_dir_value = ""
-ob_git_reference_dir_value = None
-ob_git_reference_dir_line = None
-ob_git_reference_dir_action = None
-ob_git_reference_dir_log_value = ""
-ob_git_reference_dir_log_detail = ""
 gitlab_ip_value = None
 gitlab_ip_line = None
 gitlab_ip_action = None
@@ -505,38 +505,9 @@ for index, raw_line in enumerate(lines):
     key, value = parse_assignment(raw_line)
     if key == "DL_DIR":
         dl_dir_value = value
-    elif key == "OB_GIT_REFERENCE_DIR":
-        ob_git_reference_dir_value = value
-        ob_git_reference_dir_line = index
     elif key == "GITLAB_IP":
         gitlab_ip_value = value
         gitlab_ip_line = index
-
-if dl_dir_value:
-    ob_line = f'OB_GIT_REFERENCE_DIR = "{dl_dir_value}"'
-    if ob_git_reference_dir_value is None:
-        insertion_index = 0
-        for index, raw_line in enumerate(lines):
-            stripped = raw_line.strip()
-            if stripped and not stripped.startswith("#"):
-                key, _ = parse_assignment(raw_line)
-                if key == "DL_DIR":
-                    insertion_index = index + 1
-        lines.insert(insertion_index, ob_line)
-        ob_git_reference_dir_action = "added"
-        ob_git_reference_dir_log_value = dl_dir_value
-    elif ob_git_reference_dir_value == "" and ob_git_reference_dir_line is not None:
-        lines[ob_git_reference_dir_line] = ob_line
-        ob_git_reference_dir_action = "updated"
-        ob_git_reference_dir_log_value = dl_dir_value
-    elif ob_git_reference_dir_value:
-        ob_git_reference_dir_action = "preserved"
-        ob_git_reference_dir_log_value = ob_git_reference_dir_value
-        if ob_git_reference_dir_value != dl_dir_value:
-            ob_git_reference_dir_log_detail = dl_dir_value
-elif ob_git_reference_dir_value:
-    ob_git_reference_dir_action = "preserved"
-    ob_git_reference_dir_log_value = ob_git_reference_dir_value
 
 # GITLAB_IP: auto-fill from detected git remote if the field is empty/commented-out.
 # Preserve any existing non-empty value set by the user.
@@ -569,11 +540,6 @@ except ValueError:
 
 local_conf.write_text("\n".join(lines) + "\n")
 
-if ob_git_reference_dir_action:
-    print(
-        f"OB_GIT_REFERENCE_DIR\t{ob_git_reference_dir_action}\t"
-        f"{ob_git_reference_dir_log_value}\t{ob_git_reference_dir_log_detail}"
-    )
 if gitlab_ip_action:
     print(
         f"GITLAB_IP\t{gitlab_ip_action}\t"
@@ -588,20 +554,6 @@ PY
             local marker action value detail
             IFS=$'\t' read -r marker action value detail <<< "$bline"
             case "$marker" in
-                OB_GIT_REFERENCE_DIR)
-                    case "$action" in
-                        added|updated)
-                            info "Auto-${action} OB_GIT_REFERENCE_DIR from DL_DIR: $value"
-                            ;;
-                        preserved)
-                            if [[ -n "$detail" ]]; then
-                                info "Keeping existing OB_GIT_REFERENCE_DIR: $value (DL_DIR: $detail)"
-                            else
-                                info "Keeping existing OB_GIT_REFERENCE_DIR: $value"
-                            fi
-                            ;;
-                    esac
-                    ;;
                 GITLAB_IP)
                     case "$action" in
                         set)
@@ -1180,6 +1132,67 @@ generate_dep_graph() {
     info "Found $dep_count git-based sub-repositories."
 }
 
+_clone_from_remote() {
+    local clone_url="$1"
+    local local_path="$2"
+    local branch="$3"
+    local clone_err="$4"
+
+    local full_flags=()
+    if [[ -n "$branch" ]]; then
+        full_flags+=(--single-branch --branch "$branch")
+    fi
+
+    if is_private_url "$clone_url"; then
+        verbose "Full cloning (internal) $clone_url -> $local_path"
+    else
+        verbose "Full cloning (external) $clone_url -> $local_path"
+    fi
+
+    if ! git clone "${full_flags[@]}" "$clone_url" "$local_path" 2>>"$clone_err"; then
+        rm -rf "$local_path" 2>/dev/null
+        warn "Full clone failed, retrying shallow..."
+        sleep 2
+        local shallow_flags=(--depth=1)
+        if [[ -n "$branch" ]]; then
+            shallow_flags+=(--single-branch --branch "$branch")
+        fi
+        if ! git clone "${shallow_flags[@]}" "$clone_url" "$local_path" 2>>"$clone_err"; then
+            rm -rf "$local_path" 2>/dev/null
+            # Last resort: shallow without branch constraint
+            if [[ -n "$branch" ]]; then
+                warn "Shallow clone with branch '$branch' failed, retrying without branch constraint..."
+                sleep 2
+                local no_branch_flags=(--depth=1)
+                if ! git clone "${no_branch_flags[@]}" "$clone_url" "$local_path" 2>>"$clone_err"; then
+                    rm -rf "$local_path" 2>/dev/null
+                    error "Failed to clone from $clone_url"
+                    local _last_err
+                    _last_err=$(grep -iE 'fatal|error|could not' "$clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
+                    if [[ -n "$_last_err" ]]; then
+                        error "  git: $_last_err"
+                    fi
+                    return 1
+                else
+                    warn "$(basename "$local_path") cloned shallow without branch constraint (full git history unavailable)"
+                    STATUS_SHALLOW+=("$(basename "$local_path")")
+                fi
+            else
+                error "Failed to clone from $clone_url"
+                local _last_err
+                _last_err=$(grep -iE 'fatal|error|could not' "$clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
+                if [[ -n "$_last_err" ]]; then
+                    error "  git: $_last_err"
+                fi
+                return 1
+            fi
+        else
+            STATUS_SHALLOW+=("$(basename "$local_path")")
+        fi
+    fi
+    return 0
+}
+
 clone_sub_repos() {
     # SAFETY: This function is incremental.
     #   - If a repo dir exists with .git, it does 'git fetch' instead of clone.
@@ -1202,11 +1215,10 @@ clone_sub_repos() {
 
     mkdir -p "$SRC_DIR"
 
-    local reference_root=""
-    reference_root=$(resolve_git_reference_root 2>/dev/null || true)
-    if [[ -n "$reference_root" ]]; then
-        info "Step 5 git reference cache: $reference_root"
-    fi
+    local effective_dl_dir=""
+    effective_dl_dir=$(resolve_effective_dl_dir)
+    MIRROR_BASE="$effective_dl_dir/git2"
+    info "Step 5 - Mirror Cache: $MIRROR_BASE"
 
     # Read each repo from deps.json
     local total failed=0
@@ -1298,143 +1310,66 @@ clone_sub_repos() {
         done
         # ----------------------------------------
 
-        if [[ -d "$local_path/.git" ]]; then
-            verbose "Fetching updates for $name..."
-            if ! git -C "$local_path" fetch --all 2>/dev/null; then
-                warn "Failed to fetch $name, continuing with existing state."
-            fi
+        local _clone_err="$BUILD_DIR/clone-errors.log"
+        # Increase http.postBuffer for large repos (default 1MB causes curl 18
+        # "transfer closed with outstanding read data remaining" on big packs
+        # like glibc). 512MB is safe for any single-pack transfer.
+        git config --global http.postBuffer 536870912
+
+        # --- Phase A: Ensure bare mirror exists in DL_DIR/git2/ ---
+        local mirror_path=""
+        mirror_path=$(derive_bitbake_git_mirror_path "$MIRROR_BASE" "$src_uri" 2>/dev/null || true)
+
+        if [[ -z "$mirror_path" ]]; then
+            # Cannot derive mirror path (malformed SRC_URI) — skip mirror phase
+            verbose "Cannot derive mirror path for $name, will clone working tree directly"
+        elif [[ -d "$mirror_path" ]]; then
+            # Mirror exists — skip fetch; BitBake maintains DL_DIR/git2/ during builds.
+            verbose "Mirror already exists: $mirror_path"
+            STATUS_MIRROR_EXISTING+=("$name")
         else
-            # Determine local mirror (BitBake downloads cache)
-            local reference_repo=""
-            local local_mirror=""
-            if [[ -n "$reference_root" && -n "$src_uri" ]]; then
-                reference_repo=$(derive_bitbake_git_mirror_path "$reference_root" "$src_uri" 2>/dev/null || true)
-                if [[ -n "$reference_repo" && -d "$reference_repo" ]]; then
-                    local_mirror="$reference_repo"
-                fi
-            fi
-
-            # --- Mode A: local mirror exists -> clone directly from it (zero network) ---
-            if [[ -n "$local_mirror" ]]; then
-                local mirror_clone_flags=(--no-local)
-                if [[ -n "$branch" ]]; then
-                    mirror_clone_flags+=(--single-branch --branch "$branch")
-                fi
-                verbose "Cloning from LOCAL mirror: $local_mirror -> $local_path"
-                if git clone "${mirror_clone_flags[@]}" "$local_mirror" "$local_path" 2>/dev/null; then
-                    # Clone succeeded — checkout srcrev if specified
-                    if [[ -n "$srcrev" && "$srcrev" != "\${AUTOREV}" ]]; then
-                        git -C "$local_path" checkout "$srcrev" 2>/dev/null || true
-                    fi
-                    continue  # success, move to next repo
-                fi
-                warn "Local mirror clone failed for $name, falling back to remote..."
-                rm -rf "$local_path" 2>/dev/null
-            fi
-
-            # --- Mode B: no local mirror -> clone from remote ---
-            # Strategy:
-            #   Both internal & external repos -> full clone first (complete history
-            #   for shared DL_DIR reuse). Shallow clone as last-resort fallback.
-            local _clone_err="$BUILD_DIR/clone-errors.log"
-
-            # Increase http.postBuffer for large repos (default 1MB causes curl 18
-            # "transfer closed with outstanding read data remaining" on big packs
-            # like glibc). 512MB is safe for any single-pack transfer.
-            git config --global http.postBuffer 536870912
-
-            if is_private_url "$clone_url"; then
-                # ========== Internal repo: full clone first (fast on LAN) ==========
-                local full_flags=()
-                if [[ -n "$branch" ]]; then
-                    full_flags+=(--single-branch --branch "$branch")
-                fi
-                verbose "Full cloning (internal) $clone_url -> $local_path"
-                if ! git clone "${full_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
-                    rm -rf "$local_path" 2>/dev/null
-                    # Fallback: shallow clone
-                    warn "Full clone failed for $name, retrying shallow..."
-                    sleep 2
-                    local shallow_flags=(--depth=1)
-                    if [[ -n "$branch" ]]; then
-                        shallow_flags+=(--single-branch --branch "$branch")
-                    fi
-                    if ! git clone "${shallow_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
-                        rm -rf "$local_path" 2>/dev/null
-                        error "Failed to clone $name from $clone_url"
-                        local _last_err
-                        _last_err=$(grep -iE 'fatal|error|could not' "$_clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
-                        if [[ -n "$_last_err" ]]; then
-                            error "  git: $_last_err"
-                        fi
-                        STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
-                        failed=$((failed + 1))
-                        continue
-                    fi
-                    STATUS_SHALLOW+=("$name")
-                fi
+            # Mirror missing — create full bare clone from remote
+            verbose "Creating bare mirror: $clone_url -> $mirror_path"
+            mkdir -p "$(dirname "$mirror_path")"
+            if git clone --bare "$clone_url" "$mirror_path" 2>>"$_clone_err"; then
+                STATUS_MIRROR_NEW+=("$name")
             else
-                # ========== External repo: full clone first (complete for DL_DIR reuse) ==========
-                local full_flags=()
-                if [[ -n "$branch" ]]; then
-                    full_flags+=(--single-branch --branch "$branch")
-                fi
-                if [[ -n "$reference_repo" && -d "$reference_repo" ]]; then
-                    full_flags+=(--reference-if-able "$reference_repo")
-                fi
-                verbose "Full cloning (external) $clone_url -> $local_path"
-                if ! git clone "${full_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
-                    rm -rf "$local_path" 2>/dev/null
-                    # Fallback: shallow clone
-                    warn "Full clone failed for $name, retrying shallow..."
-                    sleep 2
-                    local shallow_flags=(--depth=1)
-                    if [[ -n "$branch" ]]; then
-                        shallow_flags+=(--single-branch --branch "$branch")
-                    fi
-                    if [[ -n "$reference_repo" && -d "$reference_repo" ]]; then
-                        shallow_flags+=(--reference-if-able "$reference_repo")
-                    fi
-                    if ! git clone "${shallow_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
-                        rm -rf "$local_path" 2>/dev/null
-                        # Last resort: shallow without branch constraint
-                        if [[ -n "$branch" ]]; then
-                            warn "Shallow clone with branch '$branch' failed for $name, retrying without branch constraint..."
-                            sleep 2
-                            local no_branch_flags=(--depth=1)
-                            if ! git clone "${no_branch_flags[@]}" "$clone_url" "$local_path" 2>>"$_clone_err"; then
-                                rm -rf "$local_path" 2>/dev/null
-                                error "Failed to clone $name from $clone_url"
-                                local _last_err
-                                _last_err=$(grep -iE 'fatal|error|could not' "$_clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
-                                if [[ -n "$_last_err" ]]; then
-                                    error "  git: $_last_err"
-                                fi
-                                STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
-                                failed=$((failed + 1))
-                                continue
-                            else
-                                warn "$name cloned shallow without branch constraint (full git history unavailable)"
-                                STATUS_SHALLOW+=("$name")
-                            fi
-                        else
-                            error "Failed to clone $name from $clone_url"
-                            local _last_err
-                            _last_err=$(grep -iE 'fatal|error|could not' "$_clone_err" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
-                            if [[ -n "$_last_err" ]]; then
-                                error "  git: $_last_err"
-                            fi
-                            STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
-                            failed=$((failed + 1))
-                            continue
-                        fi
-                    else
-                        STATUS_SHALLOW+=("$name")
-                    fi
-                fi
+                rm -rf "$mirror_path" 2>/dev/null
+                warn "Failed to create bare mirror for $name, will clone working tree directly"
+                mirror_path=""
             fi
         fi
 
+        # --- Phase B: Ensure working tree exists ---
+        if [[ -d "$local_path/.git" ]]; then
+            # Working tree exists — skip bulk fetch; Phase C does targeted fetch if srcrev is missing.
+            verbose "Working tree already exists: $local_path"
+        elif [[ -n "$mirror_path" && -d "$mirror_path" ]]; then
+            # No working tree, but mirror exists — clone from mirror (local, fast)
+            verbose "Cloning working tree from mirror: $mirror_path -> $local_path"
+            local wt_clone_flags=()
+            if [[ -n "$branch" ]]; then
+                wt_clone_flags+=(--single-branch --branch "$branch")
+            fi
+            if ! git clone "${wt_clone_flags[@]}" "$mirror_path" "$local_path" 2>/dev/null; then
+                rm -rf "$local_path" 2>/dev/null
+                warn "Clone from mirror failed for $name, falling back to remote..."
+                if ! _clone_from_remote "$clone_url" "$local_path" "$branch" "$_clone_err"; then
+                    STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
+                    failed=$((failed + 1))
+                    continue
+                fi
+            fi
+        else
+            # No mirror — clone directly from remote
+            if ! _clone_from_remote "$clone_url" "$local_path" "$branch" "$_clone_err"; then
+                STATUS_FAILED+=("$name (clone failed — network error or server unreachable)")
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
+
+        # --- Phase C: Checkout srcrev ---
         # Check if srcrev is usable (skip placeholder values)
         # bitbake may return "INVALID" for named SRCREV components that weren't resolved
         local skip_checkout=0
@@ -1485,6 +1420,7 @@ for item in json.load(open('$deps_json')):
 ")
 
     info "Sub-repos: ${#STATUS_SUCCESS[@]} succeeded, $failed failed."
+    info "Mirrors: ${#STATUS_MIRROR_NEW[@]} new, ${#STATUS_MIRROR_EXISTING[@]} existing in $MIRROR_BASE"
 }
 
 generate_lockfile() {
@@ -1560,7 +1496,7 @@ inject_externalsrc() {
     # Check if DL_DIR and SSTATE_DIR are already defined in local.conf.
     # If the OpenBMC repo already has these set (e.g., pointing to a shared NFS cache),
     # respect the existing configuration — don't override it from the externalsrc .inc file.
-    # This also keeps OB_GIT_REFERENCE_DIR consistent with the final DL_DIR.
+    # This also keeps DL_DIR consistent with the mirror cache path used by clone_sub_repos().
     local has_dl_dir=0
     local has_sstate_dir=0
     local dl_dir_existing=""
@@ -1590,7 +1526,7 @@ inject_externalsrc() {
         # When local.conf already has these (e.g., from OEM template or manual config),
         # overriding here would:
         #   1. Discard an existing populated download cache
-        #   2. Break consistency with OB_GIT_REFERENCE_DIR (derived from local.conf's DL_DIR)
+        #   2. Break consistency with the mirror cache path used by clone_sub_repos()
         if [[ "$has_dl_dir" -eq 0 ]]; then
             echo "DL_DIR = \"$WORKSPACE_DIR/downloads\""
         fi
@@ -1660,6 +1596,13 @@ print_report() {
             echo "  [OK] $name"
         done
         echo ""
+
+        # --- Mirror stats ---
+        if [[ -n "$MIRROR_BASE" ]]; then
+            echo "Mirrors: ${#STATUS_MIRROR_NEW[@]} new, ${#STATUS_MIRROR_EXISTING[@]} existing"
+            echo "  Mirror cache: $MIRROR_BASE"
+            echo ""
+        fi
 
         # --- Shallow repos ---
         if [[ ${#STATUS_SHALLOW[@]} -gt 0 ]]; then
