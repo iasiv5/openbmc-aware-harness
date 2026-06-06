@@ -1281,6 +1281,23 @@ clone_sub_repos() {
             fi
         fi
 
+        # ---------- URL rewrite table ----------
+        # Rewrite unreachable git:// URLs to accessible HTTPS mirrors.
+        # Each entry: original_url  rewritten_url
+        # Add new entries here as needed.
+        local _url_rewrites=(
+            "git://git.infradead.org/mtd-utils.git"
+            "https://github.com/sigma-star/mtd-utils.git"
+        )
+        for (( _i=0; _i<${#_url_rewrites[@]}; _i+=2 )); do
+            if [[ "$clone_url" == "${_url_rewrites[_i]}" ]]; then
+                verbose "URL rewrite: $clone_url -> ${_url_rewrites[_i+1]}"
+                clone_url="${_url_rewrites[_i+1]}"
+                break
+            fi
+        done
+        # ----------------------------------------
+
         if [[ -d "$local_path/.git" ]]; then
             verbose "Fetching updates for $name..."
             if ! git -C "$local_path" fetch --all 2>/dev/null; then
