@@ -830,6 +830,7 @@ require_openbmc_repo() {
     if [[ -d "$OPENBMC_DIR/.git" ]]; then
         step_header "Step 2/8: Preparing OpenBMC main repository..."
         info "Main repository already exists at $OPENBMC_DIR — skipping clone."
+        verify_source
         return 0
     fi
     info "No OpenBMC main repository found at $OPENBMC_DIR."
