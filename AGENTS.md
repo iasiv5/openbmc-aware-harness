@@ -1,4 +1,4 @@
-# AGENTS.md - openbmc-aware-harness
+# AGENTS.md - ob-harness
 
 这个仓库是 OpenBMC 上下文工作的根入口。把它当作 home。
 

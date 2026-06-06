@@ -1,4 +1,4 @@
-# openbmc-aware-harness
+# ob-harness
 
 ```raw
       ██████╗ ██████╗ ███████╗ ███╗   ██╗ ██████╗ ███╗   ███╗ ██████╗
@@ -32,8 +32,8 @@
 ### 第一步：克隆仓库
 
 ```bash
-git clone https://github.com/iasiv5/openbmc-aware-harness.git
-cd openbmc-aware-harness
+git clone https://github.com/iasiv5/ob-harness.git
+cd ob-harness
 ```
 
 ### 第二步：初始化 OpenBMC 开发环境
@@ -117,7 +117,7 @@ Options:
 ## 仓库结构
 
 ```raw
-openbmc-aware-harness/
+ob-harness/
 ├── ob                          # OpenBMC 开发环境初始化脚本
 ├── tools/                      # 工具脚本（依赖解析等）
 ├── CLAUDE.md                   # Claude Code 入口（指向 AGENTS.md）

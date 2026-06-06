@@ -610,7 +610,7 @@ verify_source() {
                     error "  Current harness source: $current_source"
                     error "  Requested source:       $requested_source"
                     error "A harness may only bind to one OpenBMC main repository source."
-                    error "To use a different source, copy openbmc-aware-harness and run ob init in the new copy."
+                    error "To use a different source, copy ob-harness and run ob init in the new copy."
                     exit 1
                 fi
             fi
