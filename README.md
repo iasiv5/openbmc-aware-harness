@@ -14,11 +14,11 @@
      ██║  ██║ ██║  ██║ ██║  ██║ ██║ ╚████║ ███████╗ ███████║ ███████║ 
      ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝ ╚══════╝ ╚══════╝ ╚══════╝ 
     ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃      OpenBMC Development Environment · ob harness · 𝓲𝓪𝓼𝓲      ┃
+    ┃      OpenBMC Development Environment · ob-harness · 𝓲𝓪𝓼𝓲      ┃
     ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
-面向 OpenBMC 固件开发的一键开发环境初始化工具。`ob init` 自动完成主仓库克隆、machine 选择、bitbake 环境初始化、子仓库拉取、lockfile 生成和 externalsrc 注入，开箱即用。
+面向 OpenBMC 固件开发的一键开发环境初始化工具。`ob init` 自动完成主仓库克隆、machine 选择、bitbake 环境初始化、依赖解析、bare mirror 缓存填充、lockfile 生成和构建缓存配置，开箱即用。
 
 ## 快速开始
 
@@ -29,14 +29,14 @@
 - 30 GB+ 可用磁盘空间
 - 网络能访问 [GitHub](https://github.com/openbmc/openbmc.git)（或自定义 OpenBMC Git 服务器）
 
-### 第一步：克隆仓库
+### 克隆仓库
 
 ```bash
 git clone https://github.com/iasiv5/ob-harness.git
 cd ob-harness
 ```
 
-### 第二步：初始化 OpenBMC 开发环境
+### 初始化 OpenBMC 开发环境
 
 ```bash
 # 交互式选择 machine 和 OpenBMC 主仓源（社区/自定义）—— 推荐
@@ -48,30 +48,14 @@ cd ob-harness
 # 预览操作但不执行
 ./ob init romulus --dry-run
 
-# 使用自定义 OpenBMC 仓库 URL，并指定 romulus machine
+# 使用自定义 OpenBMC 仓库 URL
 ./ob init romulus --url https://git.example.com/openbmc.git
 
-# 只指定自定义 OpenBMC 仓库 URL，machine 在后续交互时选择
+# 只指定自定义 URL，machine 在后续交互时选择
 ./ob init --url https://git.example.com/openbmc.git
 ```
 
-`ob init` 会自动执行以下 8 步：
-
-1. **前置检查**：验证 OS、工具链、网络和磁盘空间
-2. **克隆主仓库**：下载 OpenBMC 主仓库（社区版或自定义 URL）
-3. **解析 machine**：交互选择或直接确认目标 machine
-4. **初始化 bitbake**：执行 `source setup <machine>` 创建构建目录
-5. **生成依赖图**：运行 `bitbake -g` 并逐 recipe 解析 SRC_URI/SRCREV
-6. **拉取子仓库**：克隆全部 git 子仓库到 `workspace/src/<machine>/`
-7. **生成 lockfile**：记录所有子仓库的 commit hash，写入 `workspace/configs/<machine>.lock`
-8. **注入 externalsrc**：生成 `externalsrc-<machine>.inc` 并 include 到 `local.conf`
-
-**关键行为**：
-- **增量且幂等**：已有仓库不会重新克隆，重跑只会 fetch 更新和补齐缺失项
-- **可中断**：Ctrl+C 后重跑会从中断处继续，不会从头开始
-- **自动重试**：子仓库克隆失败时自动尝试 shallow clone → 无分支约束 clone
-
-### 第三步：构建固件
+### 构建固件
 
 ```bash
 cd workspace/openbmc
@@ -79,21 +63,30 @@ source setup <machine>
 bitbake obmc-phosphor-image
 ```
 
-### 第四步：开发和调试
-
-源码位于 `workspace/src/<machine>/<repo>/`，externalsrc 已注入，改完源码后直接重编即可生效：
-
-```bash
-cd workspace/openbmc
-source setup <machine>
-bitbake <recipe>
-```
-
 ### 查看环境状态
 
 ```bash
 ./ob status           # 查看 OpenBMC 源绑定状态
 ```
+
+## ob init 做什么
+
+`ob init` 会依次执行以下步骤：
+
+- **前置检查**：验证 OS、工具链、网络和磁盘空间
+- **准备主仓库**：下载 OpenBMC 主仓库（社区版或自定义 URL），解析目标 machine
+- **初始化 bitbake**：执行 `source setup <machine>` 创建构建目录，写入 CONNECTIVITY_CHECK_URIS 和 GITLAB_IP 等引导配置
+- **生成依赖图**：运行 `bitbake -g` 并逐 recipe 解析 SRC_URI/SRCREV
+- **填充 bare mirror 缓存**：将全部 git 子仓库以 bare clone 形式缓存到 `DL_DIR/git2/`，供 BitBake `PREMIRRORS` 加速 fetch
+- **生成 lockfile**：记录所有子仓库的 commit hash，写入 `workspace/configs/<machine>.lock`
+- **生成构建缓存配置**：生成 `externalsrc-<machine>.inc`（含 DL_DIR/SSTATE_DIR 和 externalsrc 占位），include 到 `local.conf`
+- **状态报告**：汇总 mirror 填充结果和失败项，落盘到 `workspace/configs/<machine>.report.txt`
+
+**关键行为**：
+
+- **增量且幂等**：已有 bare mirror 不会重新克隆，重跑只会补齐缺失项
+- **可中断**：Ctrl+C 后重跑会从中断处继续，不会从头开始
+- **可跳过依赖解析**：已有 `deps.json` 时可用 `--skip-deps` 跳过耗时的 bitbake -g 阶段
 
 ## 命令参考
 
@@ -106,6 +99,7 @@ Commands:
 
 Options:
   -d, --dry-run         预览操作但不执行
+  -s, --skip-deps       跳过依赖解析，复用已有 deps.json
   -u, --url <url>       使用自定义 OpenBMC 仓库 URL
   -v, --verbose         详细输出
   -h, --help            显示帮助
@@ -145,22 +139,22 @@ ob-harness/
 ├── periodic_jobs/ai_heartbeat/ # AI Heartbeat 心跳子系统
 └── workspace/                  # 工作空间（gitignore，以下子目录由 'ob init' 自动创建）
     ├── openbmc/                #  （After ob init）OpenBMC 主仓库
-    ├── src/<machine>/          #  （After ob init）子仓库源码
     ├── configs/                #  （After ob init）lockfile 和报告
     ├── downloads/              #  （After ob init）下载缓存
+    │   └── git2/               #  （After ob init）bare mirror 缓存，BitBake PREMIRRORS
     └── sstate-cache/           #  （After ob init）构建状态缓存
 ```
 
-## AI 协作能力
+## AI 协作
 
-本仓库内置了一套 AI agent 协作框架：
+本仓库内置 AI agent 上下文框架。用 Claude Code 或 GitHub Copilot 打开本仓库时，agent 会自动加载项目结构、沟通规范和开发约定，无需手动喂上下文。
 
-- **rules/**：定义 AI 的身份、用户画像、目录路由和沟通风格，每轮 session 自动加载
-- **rules/skills/**：可复用的工作流和最佳实践，按需引入
-- **rules/axioms/**：从团队经历中提炼的决策原则，用于启发深度思考
-- **AI Heartbeat**：通过 `/ai-heartbeat` slash command 手动触发的记忆积累系统，记录观测并定期反思
+- **仓库级上下文**：agent 自动理解项目目录、沟通风格和 OpenBMC 开发规范
+- **内置 Skills**：环境初始化、调试诊断等可复用工作流，按需引入
+- **记忆积累**：通过 `/ai-heartbeat` 让 AI 持续学习项目变化和团队决策
+- **决策公理**：从团队经历中提炼的决策原则，辅助深度分析
 
-这些内容是给 AI agent 用的。人类开发者通常不需要手动阅读，但如果想自定义 AI 行为，可以从 `AGENTS.md` 开始。
+入口配置在 `AGENTS.md` 和 `.github/copilot-instructions.md`，感兴趣可以翻看源码。
 
 ## 致谢
 

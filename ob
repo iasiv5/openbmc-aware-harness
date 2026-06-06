@@ -230,7 +230,7 @@ show_logo() {
     echo -e "\033[38;2;195;180;240m     ██║  ██║ ██║  ██║ ██║  ██║ ██║ ╚████║ ███████╗ ███████║ ███████║ \033[0m"
     echo -e "\033[38;2;208;184;240m     ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝ ╚══════╝ ╚══════╝ ╚══════╝ \033[0m"
     echo    "    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-    echo -e "    ┃      OpenBMC Development Environment · \\033[38;2;255;210;80mob harness\033[0m · 𝓲𝓪𝓼𝓲      ┃"
+    echo -e "    ┃      OpenBMC Development Environment · \\033[38;2;255;210;80mob-harness\033[0m · 𝓲𝓪𝓼𝓲      ┃"
     echo    "    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
 }
 
@@ -828,7 +828,7 @@ print_available_machines() {
 
 require_openbmc_repo() {
     if [[ -d "$OPENBMC_DIR/.git" ]]; then
-        step_header "Step 2/8: Preparing OpenBMC main repository..."
+        step_header "Step 2/8: Preparing OpenBMC main repository and resolving machine..."
         info "Main repository already exists at $OPENBMC_DIR — skipping clone."
         verify_source
         return 0
@@ -952,7 +952,7 @@ prerequisites_check() {
 }
 
 clone_openbmc() {
-    step_header "Step 2/8: Preparing OpenBMC main repository..."
+    step_header "Step 2/8: Preparing OpenBMC main repository and resolving machine..."
 
     verify_source
 
@@ -1492,22 +1492,32 @@ main() {
         return 0
     fi
 
-    # README Step 1/8: 前置检查。
+    # Step 1/8: 前置检查。
     prerequisites_check
 
-    # README Step 2/8: 克隆主仓库。
+    # Step 2/8: 准备主仓库并解析 machine。
     # 首次运行时 clone 主仓；重跑时做 source 校验并复用已有仓库。
     require_openbmc_repo
 
     # [OEM] Step 2 扩展动作：如当前主仓需要 vendor bootstrap，继续补齐其子目录。
     run_repo_init_script
 
-    # README Step 3/8: 解析 machine。
+    # 解析 machine（Step 2 的一部分，交互选择或确认命令行参数）。
     resolve_machine
 
     # Re-derive paths (machine may have changed via interactive resolve_machine)
     BUILD_DIR="$OPENBMC_DIR/build/$MACHINE"
     SRC_DIR="$WORKSPACE_DIR/src/$MACHINE"
+
+    # Backfill machine_first_init if lock file was written before resolve_machine()
+    if [[ -f "$SOURCE_LOCK_FILE" && -n "$MACHINE" ]]; then
+        local current_first_init
+        current_first_init=$(read_lock_field machine_first_init 2>/dev/null || true)
+        if [[ -z "$current_first_init" ]]; then
+            sed -i "s/^machine_first_init=.*/machine_first_init=$MACHINE/" "$SOURCE_LOCK_FILE"
+            verbose "Updated machine_first_init=$MACHINE in $SOURCE_LOCK_FILE"
+        fi
+    fi
 
     # --- Detect fresh run vs incremental re-run ---
     local is_rerun=0
@@ -1544,10 +1554,10 @@ main() {
         echo ""
     fi
 
-    # README Step 4/8: 初始化 bitbake。
+    # Step 3/8: 初始化 bitbake。
     init_bitbake_env
 
-    # README Step 5/8: 生成依赖图。
+    # Step 4/8: 生成依赖图。
     if [[ "$SKIP_DEPS" -eq 1 ]]; then
         local deps_json="$BUILD_DIR/deps.json"
         if [[ ! -f "$deps_json" ]]; then
@@ -1561,16 +1571,16 @@ main() {
         generate_dep_graph
     fi
 
-    # README Step 6/8: 拉取子仓库。
+    # Step 5/8: 拉取子仓库。
     clone_sub_repos
 
-    # README Step 7/8: 生成 lockfile。
+    # Step 6/8: 生成 lockfile。
     generate_lockfile
 
-    # README Step 8/8: 生成构建缓存配置。
+    # Step 7/8: 生成构建缓存配置。
     generate_build_config
 
-    # 收尾：打印并落盘最终状态报告。
+    # Step 8/8: 收尾，打印并落盘最终状态报告。
     print_report
 }
 
