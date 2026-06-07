@@ -242,6 +242,7 @@ Usage: ob <command> [options] [arguments]
 
 Commands:
   init   [<machine>]    One-click initialize OpenBMC dev environment
+  build                 Select an initialized machine and build its image
   status                Show current OpenBMC source binding status
 
 Options:
@@ -285,6 +286,9 @@ parse_args() {
                 MACHINE="$1"
                 shift
             fi
+            ;;
+        build)
+            # No arguments accepted for build
             ;;
         *)
             error "Unknown command: $COMMAND"
@@ -610,6 +614,168 @@ cmd_status() {
     echo "  Current origin:  $current_source  (origin drift detected)"
     echo "  Status:          Lock file and origin do not match"
     return 1
+}
+
+cmd_build() {
+    # === Prerequisites ===
+    if [[ ! -d "$OPENBMC_DIR/.git" ]]; then
+        error "OpenBMC main repository not found at $OPENBMC_DIR"
+        error "Run 'ob init' first."
+        exit 1
+    fi
+
+    if [[ ! -f "$SOURCE_LOCK_FILE" ]]; then
+        error "Source lock not found at $SOURCE_LOCK_FILE"
+        error "Run 'ob init' first."
+        exit 1
+    fi
+
+    # === Discover init-done machines ===
+    local -a machines=()
+    local -a init_times=()
+    local -a repo_counts=()
+
+    for init_done_file in "$CONFIGS_DIR"/*.init-done; do
+        [[ -f "$init_done_file" ]] || continue
+        local mname
+        mname=$(basename "$init_done_file" .init-done)
+        machines+=("$mname")
+
+        local init_time
+        init_time=$(cat "$init_done_file" 2>/dev/null || echo "<unknown>")
+        init_times+=("$init_time")
+
+        local lockfile="$CONFIGS_DIR/$mname.lock"
+        local repo_count=0
+        if [[ -f "$lockfile" ]]; then
+            repo_count=$(python3 -c "import json; print(len(json.load(open('$lockfile'))['sub_repos']))" 2>/dev/null || echo "?")
+        else
+            repo_count="?"
+        fi
+        repo_counts+=("$repo_count")
+    done
+
+    if [[ ${#machines[@]} -eq 0 ]]; then
+        step_header "Initialized Machines"
+        echo ""
+        echo "  (none)"
+        echo ""
+        error "No machines are ready to build."
+        error "Run 'ob init' first to initialize a machine, then come back."
+        exit 1
+    fi
+
+    # === Read main repo info ===
+    local lock_origin_url lock_source_label
+    lock_origin_url=$(read_lock_field origin_url || echo "<unknown>")
+    lock_source_label=$(read_lock_field source_label || echo "")
+
+    # === Display ===
+    step_header "OpenBMC Repository"
+    echo "  Source : $lock_origin_url${lock_source_label:+ ($lock_source_label)}"
+    echo "  Path   : $OPENBMC_DIR"
+    echo ""
+
+    step_header "Initialized Machines"
+
+    local total=${#machines[@]}
+    local idx_width=${#total}
+    local i
+    for (( i=0; i<total; i++ )); do
+        printf "  %${idx_width}d) %-20s %s    %s repos\n" \
+            "$((i + 1))" "${machines[$i]}" "${init_times[$i]}" "${repo_counts[$i]}"
+    done
+
+    echo ""
+    info "If the machine you want is not listed, run 'ob init' first."
+    echo ""
+
+    # === Interactive selection ===
+    if [[ ! -t 0 ]]; then
+        error "No interactive terminal. ob build requires interactive mode."
+        exit 1
+    fi
+
+    local selected chosen=""
+    while true; do
+        if ! read -r -p "Choose [1-${total}]: " selected; then
+            error "Unable to read selection from stdin."
+            exit 1
+        fi
+        if [[ "$selected" =~ ^[0-9]+$ ]]; then
+            if [[ "$selected" -ge 1 && "$selected" -le "$total" ]]; then
+                chosen="${machines[$((selected - 1))]}"
+                break
+            fi
+            warn "Number out of range (1-${total}): $selected"
+            continue
+        fi
+        warn "Please enter a number (1-${total})"
+    done
+
+    MACHINE="$chosen"
+    BUILD_DIR="$OPENBMC_DIR/build/$MACHINE"
+
+    echo ""
+    info "Selected: $MACHINE"
+    info "Target  : obmc-phosphor-image"
+    info "Estimated time: 1-4 hours depending on machine and cache state."
+    echo ""
+    if ! read -r -p "Press Enter to start build, Ctrl+C to cancel... "; then
+        error "Unable to read confirmation from stdin."
+        exit 1
+    fi
+
+    # === Re-enter bitbake environment ===
+    cd "$OPENBMC_DIR"
+
+    local prev_opts
+    prev_opts=$(set +o | grep nounset)
+    set +u
+    # shellcheck disable=SC1091
+    source setup "$MACHINE" "$BUILD_DIR" 2>/dev/null
+    eval "$prev_opts"
+
+    # === Run bitbake ===
+    echo ""
+    step_header "Building $MACHINE"
+    info "Running: bitbake obmc-phosphor-image"
+    echo ""
+
+    if bitbake obmc-phosphor-image; then
+        echo ""
+        step_header "Build Succeeded"
+
+        local deploy_dir="$BUILD_DIR/tmp/deploy/images/$MACHINE"
+        local image_file="$deploy_dir/obmc-phosphor-image-$MACHINE.static.mtd"
+
+        echo "  Machine : $MACHINE"
+        echo "  Image   : $image_file"
+        if [[ -f "$image_file" ]]; then
+            local image_size
+            image_size=$(du -h "$image_file" | cut -f1)
+            echo "  Size    : $image_size"
+        fi
+        echo "  Deploy  : $deploy_dir"
+        echo ""
+        info "Build completed successfully."
+    else
+        local bb_exit=$?
+        echo ""
+        step_header "Build Failed"
+        echo ""
+        error "bitbake exited with code $bb_exit"
+        echo ""
+        echo "  BitBake error details are shown above."
+        echo ""
+        echo "  Common fixes:"
+        echo "    1. Re-run:         ob build  → select same machine → retry"
+        echo "    2. Clean & retry:  cd $OPENBMC_DIR && source setup $MACHINE"
+        echo "                       bitbake -c cleansstate <failed-recipe>"
+        echo "    3. Full log:       $BUILD_DIR/tmp/log/cooker/$MACHINE/"
+        echo ""
+        exit "$bb_exit"
+    fi
 }
 
 select_openbmc_repo_url() {
@@ -1375,6 +1541,11 @@ main() {
         return 0
     fi
 
+    if [[ "$COMMAND" == "build" ]]; then
+        cmd_build
+        return 0
+    fi
+
     # Step 1/8: 前置检查。
     prerequisites_check
 
@@ -1391,6 +1562,10 @@ main() {
     # Re-derive paths (machine may have changed via interactive resolve_machine)
     BUILD_DIR="$OPENBMC_DIR/build/$MACHINE"
     SRC_DIR="$WORKSPACE_DIR/src/$MACHINE"
+
+    # Remove init-done marker before starting work (re-entering init flow).
+    # This ensures ob build never sees a stale marker if init is interrupted.
+    rm -f "$CONFIGS_DIR/$MACHINE.init-done"
 
     # Backfill machine_first_init if lock file was written before resolve_machine()
     if [[ -f "$SOURCE_LOCK_FILE" && -n "$MACHINE" ]]; then
@@ -1465,6 +1640,10 @@ main() {
 
     # Step 8/8: 收尾，打印并落盘最终状态报告。
     print_report
+
+    # Write init-done marker (all 8 steps completed successfully).
+    # ob build uses this to discover buildable machines.
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$CONFIGS_DIR/$MACHINE.init-done"
 }
 
 if [[ -z "${OB_NO_MAIN:-}" ]]; then
