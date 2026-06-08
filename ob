@@ -691,11 +691,11 @@ status_section_machines() {
     done
 
     # Print summary table header
-    printf "  %-22s %-10s %-7s %s\n" "Machine" "Init" "Repos" "Build"
+    printf "  %-22s %-10s %s\n" "Machine" "Init" "Build"
     for m in "${sorted_machines[@]}"; do
         local m_padded
         printf -v m_padded "%-22s" "$m"
-        printf "  %b%-10s %-7s %s\n" "${YELLOW}${m_padded}${NC}" "${m_init[$m]}" "${m_repos[$m]}" "${m_build[$m]}"
+        printf "  %b%-10s %s\n" "${YELLOW}${m_padded}${NC}" "${m_init[$m]}" "${m_build[$m]}"
     done
 
     # --- Per-machine expansion ---
@@ -720,8 +720,11 @@ status_section_machines() {
         # Repos
         echo "    Repos        : ${m_repos[$m]}"
 
-        # Build
-        echo "    Build        : ${m_build[$m]}"
+        # Image details (only when build succeeded)
+        if [[ -n "${m_image[$m]:-}" ]]; then
+            echo "    Image name   : $(basename "${m_image[$m]}")"
+            echo "    Image path   : $(dirname "${m_image[$m]}")/"
+        fi
     done
 }
 
