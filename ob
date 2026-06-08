@@ -1897,7 +1897,7 @@ cmd_menu() {
             show_brand_line
         fi
 
-        echo "Please select a task (1/2/3/C/Q):"
+        echo "Please select a task:"
         echo "    1 - init   - Initialize OpenBMC development environment"
         echo "    2 - build  - Build OpenBMC firmware image"
         echo "    3 - status - Show current OpenBMC workspace status"
@@ -1908,7 +1908,7 @@ cmd_menu() {
         echo ""
 
         local choice
-        read -r -p "$(echo -e "${PROMPT_PREFIX} ")" choice
+        read -r -p "$(echo -e "${PROMPT_PREFIX} Choose [1/2/3/C/Q]: ")" choice
 
         case "$choice" in
             1)
