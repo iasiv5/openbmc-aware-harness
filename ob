@@ -1889,8 +1889,7 @@ cmd_menu() {
 
     local first_run=1
 
-    # First entry: clear + full logo
-    clear
+    # First entry: show logo (no clear — preserve user's terminal history)
     show_logo
 
     while true; do
