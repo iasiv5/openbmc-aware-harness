@@ -566,75 +566,215 @@ verify_source() {
     return 0
 }
 
-cmd_status() {
-    local lock_exists=0
-    local repo_exists=0
-    local normalized_source=""
-    local origin_url=""
-    local source_label=""
-    local machine_first_init=""
-    local created_at=""
-    local current_origin=""
-    local current_source=""
+# === ob status: Section 1 — Main Repository ===
+status_section_main_repo() {
+    step_header "OpenBMC Main Repository"
 
-    [[ -f "$SOURCE_LOCK_FILE" ]] && lock_exists=1
-    [[ -d "$OPENBMC_DIR/.git" ]] && repo_exists=1
-
-    if [[ "$lock_exists" -eq 1 ]]; then
-        normalized_source=$(read_lock_field normalized_source || true)
-        origin_url=$(read_lock_field origin_url || true)
-        source_label=$(read_lock_field source_label || true)
-        machine_first_init=$(read_lock_field machine_first_init || true)
-        created_at=$(read_lock_field created_at || true)
+    if [[ ! -d "$OPENBMC_DIR/.git" ]]; then
+        echo "  Status       : missing"
+        return 0
     fi
 
-    if [[ "$repo_exists" -eq 1 ]]; then
-        current_origin=$(git -C "$OPENBMC_DIR" remote get-url origin 2>/dev/null || true)
-        if [[ -n "$current_origin" ]]; then
-            current_source=$(normalize_repo_url "$current_origin")
+    # Source (origin URL + label)
+    local origin_url=""
+    local source_label=""
+    origin_url=$(git -C "$OPENBMC_DIR" remote get-url origin 2>/dev/null || true)
+    if [[ -f "$SOURCE_LOCK_FILE" ]]; then
+        source_label=$(read_lock_field source_label 2>/dev/null || true)
+    fi
+    local source_display="${origin_url:-<no origin>}${source_label:+ ($source_label)}"
+
+    # Branch & commit
+    local branch=""
+    local commit_line=""
+    branch=$(git -C "$OPENBMC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    commit_line=$(git -C "$OPENBMC_DIR" log --oneline -1 2>/dev/null || true)
+
+    # Upstream comparison (network, best-effort)
+    local upstream_display="⚠️ unreachable (skipped)"
+    if timeout 10 git -C "$OPENBMC_DIR" fetch origin --quiet 2>/dev/null; then
+        local ahead behind
+        ahead=$(git -C "$OPENBMC_DIR" rev-list --count "origin/${branch}..HEAD" 2>/dev/null || echo "0")
+        behind=$(git -C "$OPENBMC_DIR" rev-list --count "HEAD..origin/${branch}" 2>/dev/null || echo "0")
+        if [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then
+            upstream_display="✅ up-to-date"
+        elif [[ "$behind" -gt 0 ]]; then
+            upstream_display="⬇️ behind ${behind}${ahead:+, ⬆️ ahead ${ahead}}"
+        else
+            upstream_display="⬆️ ahead ${ahead}"
         fi
     fi
 
-    echo "OpenBMC main repository binding status"
+    # First init time
+    local first_init=""
+    if [[ -f "$SOURCE_LOCK_FILE" ]]; then
+        local raw_time
+        raw_time=$(read_lock_field created_at 2>/dev/null || true)
+        if [[ -n "$raw_time" ]]; then
+            # Format ISO to readable: 2026-06-06T17:13:41Z → 2026-06-06 17:13 UTC
+            first_init=$(echo "$raw_time" | sed -E 's/T([0-9]{2}:[0-9]{2}):.*/ \1 UTC/' | sed 's/Z//')
+        fi
+    fi
 
-    if [[ "$lock_exists" -eq 0 ]] && [[ "$repo_exists" -eq 0 ]]; then
-        echo "  Status:          Not initialized"
-        echo "  Tip:             Run ob init <machine>"
+    echo "  Status       : present"
+    echo "  Source       : $source_display"
+    echo "  Local path   : $OPENBMC_DIR"
+    echo "  Branch       : ${branch:-<unknown>}"
+    echo "  Commit       : ${commit_line:-<unknown>}"
+    echo "  Upstream     : $upstream_display"
+    echo "  First init   : ${first_init:-<unknown>}"
+}
+
+# === ob status: Section 2 — Machines ===
+status_section_machines() {
+    step_header "Machines"
+
+    # Discover machines: from .init-done and .lock files, merged and deduplicated
+    local -a machines=()
+    local -A seen_machines=()
+
+    for f in "$CONFIGS_DIR"/*.init-done "$CONFIGS_DIR"/*.lock; do
+        [[ -f "$f" ]] || continue
+        local mname
+        mname=$(basename "$f" | sed -E 's/\.(init-done|lock)$//')
+        # Skip the main repo source lock (not a per-machine lock)
+        [[ "$mname" == "openbmc-source" ]] && continue
+        if [[ -z "${seen_machines[$mname]:-}" ]]; then
+            seen_machines["$mname"]=1
+            machines+=("$mname")
+        fi
+    done
+
+    if [[ ${#machines[@]} -eq 0 ]]; then
+        echo "  (none)"
         return 0
     fi
 
-    if [[ "$lock_exists" -eq 0 ]] && [[ "$repo_exists" -eq 1 ]]; then
-        echo "  Status:          Repository present without source lock"
-        echo "  Current origin:  ${current_source:-<missing origin>}"
-        echo "  Tip:             Re-run ob init to bootstrap openbmc-source.lock"
-        return 0
-    fi
+    # Sort machine names
+    local -a sorted_machines=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && sorted_machines+=("$line")
+    done < <(printf '%s\n' "${machines[@]}" | sort)
 
-    echo "  Bound source:    $normalized_source${source_label:+  ($source_label)}"
-    echo "  Origin URL:      ${origin_url:-<unknown>}"
-    echo "  First init:      ${machine_first_init:-<unknown>}  @ ${created_at:-<unknown>}"
+    # --- Summary table ---
+    # Collect per-machine data
+    local -A m_init=() m_repos=() m_build=() m_image=()
+
+    for m in "${sorted_machines[@]}"; do
+        # Init status
+        if [[ -f "$CONFIGS_DIR/$m.init-done" ]]; then
+            m_init["$m"]="✅ done"
+        elif [[ -f "$CONFIGS_DIR/$m.lock" ]]; then
+            m_init["$m"]="⏳ partial"
+        else
+            m_init["$m"]="—"
+        fi
+
+        # Repos count
+        if [[ -f "$CONFIGS_DIR/$m.lock" ]]; then
+            m_repos["$m"]=$(python3 -c "import json; print(len(json.load(open('$CONFIGS_DIR/$m.lock'))['sub_repos']))" 2>/dev/null || echo "?")
+        else
+            m_repos["$m"]="—"
+        fi
+
+        # Build status
+        local image_path="$OPENBMC_DIR/build/$m/tmp/deploy/images/$m/obmc-phosphor-image-$m.static.mtd"
+        if [[ -f "$image_path" ]]; then
+            m_build["$m"]="🔨 succeeded"
+            m_image["$m"]="$image_path"
+        elif [[ -d "$OPENBMC_DIR/build/$m" ]]; then
+            m_build["$m"]="❌ failed"
+        else
+            m_build["$m"]="— never"
+        fi
+    done
+
+    # Print summary table header
+    printf "  %-22s %-10s %-7s %s\n" "Machine" "Init" "Repos" "Build"
+    for m in "${sorted_machines[@]}"; do
+        local m_padded
+        printf -v m_padded "%-22s" "$m"
+        printf "  %b%-10s %-7s %s\n" "${YELLOW}${m_padded}${NC}" "${m_init[$m]}" "${m_repos[$m]}" "${m_build[$m]}"
+    done
+
+    # --- Per-machine expansion ---
+    for m in "${sorted_machines[@]}"; do
+        # Only expand machines that have a .lock file (meaningful data)
+        [[ -f "$CONFIGS_DIR/$m.lock" ]] || continue
+
+        echo ""
+        echo "  ── $m ──────────────────────────────────────"
+
+        # Init time
+        local init_time=""
+        if [[ -f "$CONFIGS_DIR/$m.init-done" ]]; then
+            local raw_init_time
+            raw_init_time=$(head -1 "$CONFIGS_DIR/$m.init-done" 2>/dev/null || true)
+            if [[ -n "$raw_init_time" ]]; then
+                init_time=$(echo "$raw_init_time" | sed -E 's/T([0-9]{2}:[0-9]{2}):.*/ \1 UTC/' | sed 's/Z//')
+            fi
+        fi
+        echo "    Init time    : ${init_time:--}"
+
+        # Repos
+        echo "    Repos        : ${m_repos[$m]}"
+
+        # Build
+        echo "    Build        : ${m_build[$m]}"
+    done
+}
+
+# === ob status: Section 3 — Tips ===
+status_section_tips() {
+    local repo_exists="$1"
+    local has_init_done="$2"
+    local has_never_built="$3"
+
+    local tip=""
 
     if [[ "$repo_exists" -eq 0 ]]; then
-        echo "  Current origin:  Repository missing"
-        echo "  Status:          Main repository not cloned or was deleted"
-        return 0
+        tip="💡 Run 'ob init' to get started."
+    elif [[ "$has_init_done" -eq 0 ]]; then
+        tip="💡 Run 'ob init' to initialize a machine."
+    elif [[ "$has_never_built" -eq 1 ]]; then
+        tip="💡 Run 'ob build' to build a machine."
     fi
 
-    if [[ -z "$current_origin" ]]; then
-        echo "  Current origin:  <missing origin>"
-        echo "  Status:          Origin remote missing"
-        return 0
+    if [[ -n "$tip" ]]; then
+        echo ""
+        echo "  $tip"
     fi
+}
 
-    if [[ "$current_source" == "$normalized_source" ]]; then
-        echo "  Current origin:  $current_source  (origin matches)"
-        echo "  Status:          OK"
-        return 0
-    fi
+# === ob status: Main orchestrator ===
+cmd_status() {
+    local repo_exists=0
+    [[ -d "$OPENBMC_DIR/.git" ]] && repo_exists=1
 
-    echo "  Current origin:  $current_source  (origin drift detected)"
-    echo "  Status:          Lock file and origin do not match"
-    return 1
+    # Section 1: Main repo info (always shown)
+    status_section_main_repo
+
+    echo ""
+
+    # Section 2: Machine list + expansion (always shown, even if repo missing — may have residual data)
+    status_section_machines
+
+    # Section 3: Dynamic tips
+    local has_init_done=0
+    local has_never_built=0
+    for f in "$CONFIGS_DIR"/*.init-done; do
+        [[ -f "$f" ]] || continue
+        has_init_done=1
+        local mname
+        mname=$(basename "$f" .init-done)
+        local image_path="$OPENBMC_DIR/build/$mname/tmp/deploy/images/$mname/obmc-phosphor-image-$mname.static.mtd"
+        if [[ ! -f "$image_path" ]]; then
+            has_never_built=1
+        fi
+        break
+    done
+
+    status_section_tips "$repo_exists" "$has_init_done" "$has_never_built"
 }
 
 cmd_build() {
@@ -1720,8 +1860,8 @@ cmd_menu() {
         echo "    1 - init   - Initialize OpenBMC development environment"
         echo "    2 - build  - Build OpenBMC firmware image"
         echo "    3 - status - Show current OpenBMC workspace status"
-        echo "    C - Clear terminal screen (c/C)"
-        echo "    Q - Quit this script (q/Q)"
+        echo "    C - Clear terminal screen  (c/C)"
+        echo "    Q - Quit this 'ob' session (q/Q)"
         echo ""
         echo "Tip: CLI mode — ./ob init <machine> | ./ob build | ./ob --help"
         echo ""
