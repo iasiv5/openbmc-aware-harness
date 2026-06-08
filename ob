@@ -1064,7 +1064,7 @@ prerequisites_check() {
     # Network check (best-effort)
     if command -v curl &>/dev/null; then
         local http_code
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://github.com 2>/dev/null || echo "000")
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 https://github.com 2>/dev/null || echo "000")
         if [[ "$http_code" != "200" && "$http_code" != "301" && "$http_code" != "302" ]]; then
             warn "github.com may not be reachable (HTTP $http_code). Clone may fail."
         else
