@@ -679,7 +679,7 @@ status_section_machines() {
 
         # Build status — glob for *.static.mtd to handle custom image names
         local image_path=""
-        image_path=$(ls "$OPENBMC_DIR/build/$m/tmp/deploy/images/$m/"*.static.mtd 2>/dev/null | head -1)
+        image_path=$(ls "$OPENBMC_DIR/build/$m/tmp/deploy/images/$m/"*.static.mtd 2>/dev/null | head -1 || true)
         if [[ -n "$image_path" && -f "$image_path" ]]; then
             m_build["$m"]="🔨 succeeded"
             m_image["$m"]="$image_path"
@@ -775,7 +775,7 @@ cmd_status() {
         local mname
         mname=$(basename "$f" .init-done)
         local image_path=""
-        image_path=$(ls "$OPENBMC_DIR/build/$mname/tmp/deploy/images/$mname/"*.static.mtd 2>/dev/null | head -1)
+        image_path=$(ls "$OPENBMC_DIR/build/$mname/tmp/deploy/images/$mname/"*.static.mtd 2>/dev/null | head -1 || true)
         if [[ -z "$image_path" ]]; then
             has_never_built=1
         fi
@@ -1508,7 +1508,7 @@ clone_sub_repos() {
             local _local_conf="$BUILD_DIR/conf/local.conf"
             # Extract all ${VAR} names from clone_url
             local _var_names
-            _var_names=$(echo "$clone_url" | grep -oP '\$\{[A-Za-z_][A-Za-z0-9_]*\}' | sort -u)
+            _var_names=$(echo "$clone_url" | grep -oP '\$\{[A-Za-z_][A-Za-z0-9_]*\}' | sort -u || true)
             for _vk in $_var_names; do
                 local _vn="${_vk#\$\{}"
                 _vn="${_vn%\}}"
