@@ -34,9 +34,16 @@ QEMU_NO_WAIT=0
 QEMU_FORCE=0
 QEMU_STOP_ALL=0
 QEMU_BIN_DIR=""       # derived: workspace/qemu-bin/<source>
-QEMU_BIN_FILE=""      # derived: workspace/qemu-bin/<source>/qemu-system-arm
+QEMU_BIN_FILE=""      # derived: workspace/qemu-bin/<source>/<QB_SYSTEM_NAME>
 QEMU_PIDS_DIR=""      # derived: workspace/qemu-bin/.pids
 QEMU_PID_FILE=""      # derived: workspace/qemu-bin/.pids/<machine>.pid
+
+# QEMU QB vars (resolved via bitbake -e) + binary URL config
+QB_MACHINE_NAME=""        # derived: <name> from "-machine <name>"
+QB_MEM_SIZE_FLAG=""       # derived: "-m <size>"
+QB_SYSTEM_NAME=""         # derived: qemu-system-arm | qemu-system-aarch64
+QEMU_URL_CONFIG_FILE=""   # derived: workspace/qemu-bin/qemu-binary-urls.conf
+QEMU_PCBIOS_DIR=""        # derived: workspace/qemu-bin/<source>/pc-bios
 
 # === Colors ===
 RED='\033[0;31m'
@@ -59,6 +66,28 @@ trim_whitespace() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     echo "$value"
+}
+
+# Convert ISO 8601 UTC timestamp to local display format (UTC+8).
+# Input:  "2026-06-06T17:13:41Z" or empty/unparseable
+# Output: "2026-06-07 01:13 UTC+8" or "<unknown>"
+format_timestamp() {
+    local raw="$1"
+
+    if [[ -z "$raw" ]]; then
+        echo "<unknown>"
+        return 0
+    fi
+
+    # date -d understands ISO 8601 with trailing Z as UTC.
+    # On a UTC+8 system, it automatically converts to local time.
+    local ts_local
+    ts_local=$(date -d "$raw" '+%Y-%m-%d %H:%M UTC+8' 2>/dev/null) || {
+        echo "<unknown>"
+        return 0
+    }
+
+    echo "$ts_local"
 }
 
 read_local_conf_var() {
@@ -293,7 +322,7 @@ start-qemu Options:
   --redfish-port <port>   Redfish port forwarding (default: 2443)
   --ipmi-port <port>      IPMI port forwarding    (default: 2623, UDP)
   --http-port <port>      HTTP port forwarding    (no default; set to enable)
-  --serial-log <path>     Serial log file path    (default: /tmp/qemu-<machine>-serial.log)
+  --serial-log <path>     Serial log file path    (default: ~/tmp/qemu-<machine>-serial.log)
   --no-wait               Don't wait for BMC to become ready
   --force                 Kill existing instance without confirmation
 
@@ -427,15 +456,98 @@ read_source_label() {
 }
 
 derive_qemu_paths() {
-    local label
+    local label arch
     label=$(read_source_label)
+    arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
     QEMU_BIN_DIR="$WORKSPACE_DIR/qemu-bin/$label"
-    QEMU_BIN_FILE="$QEMU_BIN_DIR/qemu-system-arm"
+    QEMU_BIN_FILE="$QEMU_BIN_DIR/$arch"
     QEMU_PIDS_DIR="$WORKSPACE_DIR/qemu-bin/.pids"
     QEMU_PID_FILE="$QEMU_PIDS_DIR/${MACHINE}.pid"
 }
 
-ensure_qemu_binary() {
+derive_qemu_url_config_path() {
+    QEMU_URL_CONFIG_FILE="$WORKSPACE_DIR/qemu-bin/qemu-binary-urls.conf"
+}
+
+read_qemu_url_config() {
+    local source="$1"
+    local arch="$2"
+    local key
+    local key_re
+    local url
+
+    key="${source}.${arch}"
+    key_re="${key//./\\.}"
+    derive_qemu_url_config_path
+
+    [[ -f "$QEMU_URL_CONFIG_FILE" ]] || return 0
+
+    url=$(grep "^${key_re}=" "$QEMU_URL_CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+    trim_whitespace "$url"
+}
+
+write_qemu_url_config() {
+    local source="$1"
+    local arch="$2"
+    local url="$3"
+    local key
+    local key_re
+    local tmp
+
+    key="${source}.${arch}"
+    key_re="${key//./\\.}"
+    derive_qemu_url_config_path
+
+    mkdir -p "$(dirname "$QEMU_URL_CONFIG_FILE")"
+    if [[ ! -f "$QEMU_URL_CONFIG_FILE" ]]; then
+        echo "# qemu binary download URLs — auto-managed by 'ob start-qemu'" > "$QEMU_URL_CONFIG_FILE"
+        echo "# key: <source_label>.<QB_SYSTEM_NAME>" >> "$QEMU_URL_CONFIG_FILE"
+    fi
+
+    if grep -q "^${key_re}=" "$QEMU_URL_CONFIG_FILE"; then
+        tmp=$(mktemp "${TMPDIR:-/tmp}/qemu-url-conf-XXXXXX")
+        grep -v "^${key_re}=" "$QEMU_URL_CONFIG_FILE" > "$tmp"
+        echo "${key}=${url}" >> "$tmp"
+        mv "$tmp" "$QEMU_URL_CONFIG_FILE"
+    else
+        echo "${key}=${url}" >> "$QEMU_URL_CONFIG_FILE"
+    fi
+}
+
+write_qemu_binary_manifest() {
+    local install_source="$1"
+    local arch="$2"
+    local source_key="$3"
+    local source_value="$4"
+    local sha256="$5"
+    local manifest_path="${QEMU_BIN_FILE}.manifest"
+
+    cat > "$manifest_path" <<MANIFEST_EOF
+asset=binary
+source=${install_source}
+arch=${arch}
+binary_path=${QEMU_BIN_FILE}
+${source_key}=${source_value}
+installed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+sha256=${sha256}
+MANIFEST_EOF
+}
+
+write_qemu_pcbios_manifest() {
+    local install_source="$1"
+    local pcbios_source_path="$2"
+    local manifest_path="$QEMU_BIN_DIR/pc-bios.manifest"
+
+    cat > "$manifest_path" <<MANIFEST_EOF
+asset=pc-bios
+source=${install_source}
+pcbios_path=${QEMU_BIN_DIR}/pc-bios
+pcbios_source=${pcbios_source_path}
+installed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+MANIFEST_EOF
+}
+
+ensure_qemu_binary_community() {
     derive_qemu_paths
 
     # Already downloaded and executable?
@@ -446,128 +558,409 @@ ensure_qemu_binary() {
 
     local label
     label=$(read_source_label)
-    local manifest="$QEMU_BIN_DIR/.manifest"
-
     mkdir -p "$QEMU_BIN_DIR"
 
-    if [[ "$label" == "community" ]]; then
-        # ── Community: download from OpenBMC Jenkins ──
-        local jenkins_url="https://jenkins.openbmc.org/job/latest-qemu-x86/lastSuccessfulBuild/artifact/qemu/build/qemu-system-arm"
-        local build_number=""
+    local arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+    local qemu_url=""
 
-        info "Downloading QEMU binary from OpenBMC Jenkins..."
-        verbose "  URL: $jenkins_url"
-
-        # Fetch build number for manifest
-        build_number=$(curl -sf "https://jenkins.openbmc.org/job/latest-qemu-x86/lastSuccessfulBuild/api/json?tree=number" 2>/dev/null \
-            | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null || echo "unknown")
-
-        if ! curl -fSL -o "$QEMU_BIN_FILE" "$jenkins_url" 2>/dev/null; then
-            error "Failed to download QEMU binary from Jenkins."
-            error "  URL: $jenkins_url"
-            rm -f "$QEMU_BIN_FILE"
-            exit 1
-        fi
-
-        chmod +x "$QEMU_BIN_FILE"
-
-        local sha256=""
-        sha256=$(sha256sum "$QEMU_BIN_FILE" | awk '{print $1}')
-
-        cat > "$manifest" <<MANIFEST_EOF
-source=community
-url=${jenkins_url}
-jenkins_build=${build_number}
-downloaded_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-sha256=${sha256}
-MANIFEST_EOF
-
-        info "QEMU binary downloaded: $QEMU_BIN_FILE"
-        verbose "  Jenkins build: $build_number"
-        verbose "  SHA256: $sha256"
-
+    if [[ -n "${OB_QEMU_BINARY_URL:-}" ]]; then
+        qemu_url="$OB_QEMU_BINARY_URL"
+        write_qemu_url_config "$label" "$arch" "$qemu_url"
     else
-        # ── Custom: download from configured URL ──
-        local custom_url=""
-        custom_url="${OB_QEMU_BINARY_URL:-}"
+        qemu_url="$(read_qemu_url_config "$label" "$arch")"
+    fi
 
-        # Fallback: look for enterprise meta layer config
-        if [[ -z "$custom_url" ]]; then
-            for _candidate in "$WORKSPACE_DIR/openbmc"/meta-*/qemu-binary-url.sh; do
-                if [[ -f "$_candidate" ]]; then
-                    # shellcheck source=/dev/null
-                    source "$_candidate"
-                    custom_url="${QEMU_BINARY_URL:-}"
-                    break
-                fi
-            done
-        fi
+    if [[ -z "$qemu_url" ]]; then
+        if [[ "$label" == "community" && "$arch" == "qemu-system-arm" ]]; then
+            qemu_url="https://jenkins.openbmc.org/job/latest-qemu-x86/lastSuccessfulBuild/artifact/qemu/build/qemu-system-arm"
+            write_qemu_url_config "$label" "$arch" "$qemu_url"
+            info "Using OpenBMC Jenkins default QEMU URL (recorded in $QEMU_URL_CONFIG_FILE)"
+        else
+            if [[ "$label" == "community" && "$arch" == "qemu-system-aarch64" ]]; then
+                info "Community source provides no aarch64 QEMU binary."
+                info "Provide a custom download URL below, or press Enter / Ctrl-C to abort."
+            fi
 
-        if [[ -z "$custom_url" ]]; then
-            error "Custom QEMU binary URL not configured."
-            error "Set OB_QEMU_BINARY_URL environment variable or provide meta-*/qemu-binary-url.sh"
-            exit 1
-        fi
-
-        info "Downloading custom QEMU binary..."
-        verbose "  URL: $custom_url"
-
-        local tmp_download
-        tmp_download=$(mktemp /tmp/qemu-binary-XXXXXX)
-
-        if ! curl -fSL -o "$tmp_download" "$custom_url" 2>/dev/null; then
-            error "Failed to download QEMU binary from: $custom_url"
-            rm -f "$tmp_download"
-            exit 1
-        fi
-
-        # Detect file type: tarball or single binary
-        local file_type
-        file_type=$(file -b "$tmp_download" 2>/dev/null || echo "")
-
-        if echo "$file_type" | grep -qi "gzip\|xz"; then
-            # Tarball — extract
-            verbose "  Detected archive, extracting..."
-            tar xf "$tmp_download" -C "$QEMU_BIN_DIR/" --strip-components=1 2>/dev/null \
-                || tar xf "$tmp_download" -C "$QEMU_BIN_DIR/" 2>/dev/null
-            rm -f "$tmp_download"
-
-            # Locate the binary
-            local found_bin=""
-            for candidate in "$QEMU_BIN_DIR"/qemu-system-arm "$QEMU_BIN_DIR"/bin/qemu-system-arm \
-                             "$QEMU_BIN_DIR"/qemu-system-aarch64 "$QEMU_BIN_DIR"/bin/qemu-system-aarch64; do
-                if [[ -f "$candidate" ]]; then
-                    found_bin="$candidate"
-                    break
-                fi
-            done
-
-            if [[ -z "$found_bin" ]]; then
-                error "Could not find qemu-system-arm or qemu-system-aarch64 in extracted archive."
+            derive_qemu_url_config_path
+            if [[ ! -t 0 ]]; then
+                error "QEMU binary URL not configured for '${label}.${arch}'."
+                error "Set OB_QEMU_BINARY_URL, or add a line '${label}.${arch}=<url>' to:"
+                error "  $QEMU_URL_CONFIG_FILE"
                 exit 1
             fi
 
-            QEMU_BIN_FILE="$found_bin"
-            chmod +x "$QEMU_BIN_FILE"
+            local input_url=""
+            read -r -p "$(echo -e "${PROMPT_PREFIX} Enter QEMU binary URL for ${label}.${arch}: ")" input_url || true
+            input_url="$(trim_whitespace "$input_url")"
+            if [[ -z "$input_url" ]]; then
+                info "No URL provided — aborting QEMU binary setup."
+                exit 0
+            fi
+            if [[ ! "$input_url" =~ ^https?:// ]]; then
+                error "Invalid URL (must start with http:// or https://): $input_url"
+                exit 1
+            fi
 
-        else
-            # Single binary
-            mv "$tmp_download" "$QEMU_BIN_FILE"
-            chmod +x "$QEMU_BIN_FILE"
+            qemu_url="$input_url"
+            write_qemu_url_config "$label" "$arch" "$qemu_url"
+        fi
+    fi
+
+    info "Downloading QEMU binary..."
+    verbose "  URL: $qemu_url"
+
+    local tmp_download
+    tmp_download=$(mktemp "${TMPDIR:-/tmp}/qemu-binary-XXXXXX")
+
+    if ! curl -fSL -o "$tmp_download" "$qemu_url"; then
+        error "Failed to download QEMU binary from: $qemu_url"
+        rm -f "$tmp_download"
+        exit 1
+    fi
+
+    # Detect file type: tarball or single binary
+    local file_type
+    file_type=$(file -b "$tmp_download" 2>/dev/null || echo "")
+
+    if echo "$file_type" | grep -qi "gzip\|xz"; then
+        # Tarball — extract
+        verbose "  Detected archive, extracting..."
+        tar xf "$tmp_download" -C "$QEMU_BIN_DIR/" --strip-components=1 2>/dev/null \
+            || tar xf "$tmp_download" -C "$QEMU_BIN_DIR/" 2>/dev/null
+        rm -f "$tmp_download"
+
+        local found_bin=""
+        for candidate in "$QEMU_BIN_DIR/$arch" "$QEMU_BIN_DIR/bin/$arch"; do
+            if [[ -f "$candidate" ]]; then
+                found_bin="$candidate"
+                break
+            fi
+        done
+
+        if [[ -z "$found_bin" ]]; then
+            error "Could not find $arch in extracted archive."
+            exit 1
         fi
 
-        local sha256=""
-        sha256=$(sha256sum "$QEMU_BIN_FILE" | awk '{print $1}')
+        if [[ "$found_bin" != "$QEMU_BIN_FILE" ]]; then
+            mv "$found_bin" "$QEMU_BIN_FILE"
+        fi
+        chmod +x "$QEMU_BIN_FILE"
+    else
+        # Single binary
+        mv "$tmp_download" "$QEMU_BIN_FILE"
+        chmod +x "$QEMU_BIN_FILE"
+    fi
 
-        cat > "$manifest" <<MANIFEST_EOF
-source=custom
-url=${custom_url}
-downloaded_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-sha256=${sha256}
-MANIFEST_EOF
+    local sha256=""
+    sha256=$(sha256sum "$QEMU_BIN_FILE" | awk '{print $1}')
 
-        info "Custom QEMU binary ready: $QEMU_BIN_FILE"
-        verbose "  SHA256: $sha256"
+    write_qemu_binary_manifest "$label" "$arch" "url" "$qemu_url" "$sha256"
+
+    info "QEMU binary ready: $QEMU_BIN_FILE"
+    verbose "  SHA256: $sha256"
+}
+
+# Dispatcher: route to community (URL download) or custom (local copy) setup
+ensure_qemu_binary() {
+    local label
+    label=$(read_source_label)
+    if [[ "$label" == "community" ]]; then
+        ensure_qemu_binary_community
+    else
+        ensure_qemu_binary_custom
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Custom QEMU Binary Setup (local path copy)
+# ──────────────────────────────────────────────
+
+ensure_qemu_binary_custom() {
+    derive_qemu_paths
+
+    # Already present and executable?
+    if [[ -x "$QEMU_BIN_FILE" ]]; then
+        verbose "QEMU binary already exists: $QEMU_BIN_FILE"
+        return 0
+    fi
+
+    # Need interactive terminal for prompts
+    if [[ ! -t 0 ]]; then
+        error "QEMU binary not found at $QEMU_BIN_FILE"
+        error "Run 'ob start-qemu $MACHINE' in an interactive terminal to set up the binary."
+        exit 1
+    fi
+
+    mkdir -p "$QEMU_BIN_DIR"
+
+    local arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+
+    # --- Step 1: QEMU binary ---
+    echo ""
+    info "QEMU binary for custom source not found."
+    echo ""
+
+    local input_binary=""
+    local resolved_binary_path=""
+    while true; do
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Enter absolute path to QEMU binary ($arch): ")" input_binary; then
+            error "Unable to read input."
+            exit 1
+        fi
+        input_binary=$(trim_whitespace "$input_binary")
+
+        if [[ -z "$input_binary" ]]; then
+            error "QEMU binary path cannot be empty."
+            continue
+        fi
+
+        if [[ "$input_binary" == -* ]]; then
+            error "QEMU binary path must be a filesystem path, not an option: $input_binary"
+            continue
+        fi
+
+        # Validate: must be absolute path
+        if [[ "$input_binary" != /* ]]; then
+            error "Must be an absolute path (starting with /). Got: $input_binary"
+            continue
+        fi
+
+        resolved_binary_path="$input_binary"
+        if [[ -d "$input_binary" ]]; then
+            resolved_binary_path="${input_binary%/}/$arch"
+            if [[ ! -f "$resolved_binary_path" ]]; then
+                error "Directory does not contain $arch: $input_binary"
+                continue
+            fi
+        elif [[ ! -f "$input_binary" ]]; then
+            error "File not found: $input_binary"
+            continue
+        fi
+
+        break
+    done
+
+    cp "$resolved_binary_path" "$QEMU_BIN_FILE"
+    chmod +x "$QEMU_BIN_FILE"
+    info "QEMU binary copied: $QEMU_BIN_FILE"
+
+    local input_pcbios=""
+    local resolved_pcbios_path=""
+    local target_pcbios="$QEMU_BIN_DIR/pc-bios"
+    if [[ "$SOC_TYPE" == "ast2700" ]]; then
+        echo ""
+
+        while true; do
+            if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Enter absolute path to pc-bios directory: ")" input_pcbios; then
+                error "Unable to read input."
+                exit 1
+            fi
+            input_pcbios=$(trim_whitespace "$input_pcbios")
+
+            if [[ -z "$input_pcbios" ]]; then
+                error "pc-bios directory path cannot be empty."
+                continue
+            fi
+
+            if [[ "$input_pcbios" == -* ]]; then
+                error "pc-bios directory path must be a filesystem path, not an option: $input_pcbios"
+                continue
+            fi
+
+            if [[ "$input_pcbios" != /* ]]; then
+                error "Must be an absolute path (starting with /). Got: $input_pcbios"
+                continue
+            fi
+
+            if [[ ! -d "$input_pcbios" ]]; then
+                error "Directory not found: $input_pcbios"
+                continue
+            fi
+
+            resolved_pcbios_path="$input_pcbios"
+            if [[ ! -f "$resolved_pcbios_path/ast27x0_bootrom.bin" ]]; then
+                if [[ -f "$resolved_pcbios_path/pc-bios/ast27x0_bootrom.bin" ]]; then
+                    resolved_pcbios_path="$resolved_pcbios_path/pc-bios"
+                else
+                    error "Directory does not contain ast27x0_bootrom.bin: $input_pcbios"
+                    error "Provide the pc-bios directory itself, or a QEMU root directory that contains pc-bios/."
+                    continue
+                fi
+            fi
+
+            break
+        done
+
+        if [[ -d "$target_pcbios" ]]; then
+            rm -rf "$target_pcbios"
+        fi
+        cp -r "$resolved_pcbios_path" "$target_pcbios"
+        info "pc-bios directory copied: $target_pcbios"
+    elif [[ -d "$target_pcbios" ]]; then
+        verbose "Keeping existing pc-bios directory for non-AST2700 machine: $target_pcbios"
+    fi
+
+    local sha256=""
+    sha256=$(sha256sum "$QEMU_BIN_FILE" | awk '{print $1}')
+
+    write_qemu_binary_manifest "custom" "$arch" "binary_source" "$resolved_binary_path" "$sha256"
+    if [[ -n "$resolved_pcbios_path" ]]; then
+        write_qemu_pcbios_manifest "custom" "$resolved_pcbios_path"
+    fi
+
+    info "QEMU binary setup complete."
+    verbose "  Binary : $QEMU_BIN_FILE"
+    verbose "  SHA256 : $sha256"
+}
+
+# ──────────────────────────────────────────────
+# AST2700 Bootloader File Detection
+# ──────────────────────────────────────────────
+
+find_ast2700_bootloaders() {
+    local deploy_dir="$BUILD_DIR/tmp/deploy/images/$MACHINE"
+
+    if [[ ! -d "$deploy_dir" ]]; then
+        error "Deploy directory not found: $deploy_dir"
+        error "Run 'ob build' for machine '$MACHINE' first."
+        exit 1
+    fi
+
+    BOOTLOADER_UBOOT_NODTB="$deploy_dir/u-boot-nodtb.bin"
+    BOOTLOADER_UBOOT_DTB="$deploy_dir/u-boot.dtb"
+    BOOTLOADER_BL31="$deploy_dir/bl31.bin"
+    BOOTLOADER_OPTEE="$deploy_dir/optee/tee-raw.bin"
+
+    # Validate each file
+    local -a missing=()
+    for desc_file in \
+        "u-boot-nodtb.bin:$BOOTLOADER_UBOOT_NODTB" \
+        "u-boot.dtb:$BOOTLOADER_UBOOT_DTB" \
+        "bl31.bin:$BOOTLOADER_BL31" \
+        "optee/tee-raw.bin:$BOOTLOADER_OPTEE"
+    do
+        local desc="${desc_file%%:*}"
+        local fpath="${desc_file#*:}"
+        if [[ ! -f "$fpath" ]]; then
+            missing+=("$desc ($fpath)")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "AST2700 bootloader files not found in deploy directory:"
+        for m in "${missing[@]}"; do
+            error "  Missing: $m"
+        done
+        error "Ensure 'ob build' completed successfully for '$MACHINE'."
+        exit 1
+    fi
+
+    # Get u-boot-nodtb.bin size for DTB load offset calculation
+    BOOTLOADER_UBOOT_SIZE=$(stat --format=%s -L "$BOOTLOADER_UBOOT_NODTB" 2>/dev/null || echo "0")
+
+    verbose "AST2700 bootloaders:"
+    verbose "  u-boot-nodtb.bin : $BOOTLOADER_UBOOT_NODTB ($BOOTLOADER_UBOOT_SIZE bytes)"
+    verbose "  u-boot.dtb       : $BOOTLOADER_UBOOT_DTB"
+    verbose "  bl31.bin         : $BOOTLOADER_BL31"
+    verbose "  tee-raw.bin      : $BOOTLOADER_OPTEE"
+}
+
+# ──────────────────────────────────────────────
+# SoC-specific QEMU Command Builder
+# ──────────────────────────────────────────────
+
+build_qemu_cmd() {
+    local image_file="$1"
+    local ssh_port="$2"
+    local redfish_port="$3"
+    local ipmi_port="$4"
+    local http_port="$5"
+    local serial_log="$6"
+
+    # Port forwarding string
+    local hostfwd_args=""
+    hostfwd_args+="hostfwd=tcp::${ssh_port}-:22,"
+    hostfwd_args+="hostfwd=tcp::${redfish_port}-:443,"
+    hostfwd_args+="hostfwd=udp::${ipmi_port}-:623"
+    if [[ -n "$http_port" ]]; then
+        hostfwd_args+=",hostfwd=tcp::${http_port}-:80"
+    fi
+
+    # Start building command array
+    QEMU_CMD=(
+        "$QEMU_BIN_FILE"
+        "-machine" "$QB_MACHINE_NAME"
+    )
+
+    # SoC-specific parameters
+    if [[ "$SOC_TYPE" == "ast2700" ]]; then
+        find_ast2700_bootloaders
+        QEMU_CMD+=(
+            "-device" "loader,force-raw=on,addr=0x400000000,file=$BOOTLOADER_UBOOT_NODTB"
+            "-device" "loader,force-raw=on,addr=$((0x400000000 + BOOTLOADER_UBOOT_SIZE)),file=$BOOTLOADER_UBOOT_DTB"
+            "-device" "loader,force-raw=on,addr=0x430000000,file=$BOOTLOADER_BL31"
+            "-device" "loader,force-raw=on,addr=0x430080000,file=$BOOTLOADER_OPTEE"
+            "-device" "loader,cpu-num=0,addr=0x430000000"
+            "-device" "loader,cpu-num=1,addr=0x430000000"
+            "-device" "loader,cpu-num=2,addr=0x430000000"
+            "-device" "loader,cpu-num=3,addr=0x430000000"
+            "-smp" "4"
+        )
+    fi
+    # AST2600: bootloader is embedded in MTD image, no extra params needed
+
+    # QB_MEM (-m flag): include only if resolved from bitbake
+    if [[ -n "$QB_MEM_SIZE_FLAG" ]]; then
+        local -a qemu_mem_args=()
+        read -r -a qemu_mem_args <<< "$QB_MEM_SIZE_FLAG"
+        QEMU_CMD+=("${qemu_mem_args[@]}")
+    fi
+
+    # Common tail: drive, network, serial, display
+    QEMU_CMD+=(
+        "-drive" "file=$image_file,format=raw,if=mtd"
+        "-net" "nic,netdev=net0"
+        "-netdev" "user,id=net0,$hostfwd_args"
+        "-serial" "file:$serial_log"
+        "-serial" "null"
+        "-monitor" "none"
+        "-display" "none"
+    )
+    if [[ -d "$QEMU_PCBIOS_DIR" ]]; then
+        QEMU_CMD+=("-L" "$QEMU_PCBIOS_DIR")
+    fi
+    QEMU_CMD+=("-daemonize")
+}
+#
+# QEMU searches for firmware files in this order (with -L <dir>):
+#   1. <cwd>/<name>
+#   2. <dir>/<name>                        (the -L path)
+#   3. <QEMU_BIN_DIR>/../share/qemu-firmware/<name>
+#   4. <QEMU_BIN_DIR>/../share/qemu/<name>
+#
+# Strategy:
+# Ensure QEMU firmware directory (pc-bios) is available.
+# For custom QEMU, the user provides pc-bios/ during binary setup.
+# For community QEMU, pc-bios/ may or may not exist — QEMU will fall back
+# to its built-in firmware paths.
+ensure_qemu_firmware() {
+    QEMU_PCBIOS_DIR="$QEMU_BIN_DIR/pc-bios"
+
+    if [[ "$SOC_TYPE" != "ast2700" ]]; then
+        return 0
+    fi
+
+    if [[ ! -d "$QEMU_PCBIOS_DIR" ]]; then
+        warn "QEMU pc-bios directory not found: $QEMU_PCBIOS_DIR"
+        warn "Custom QEMU requires pc-bios/. Ensure it was provided during binary setup."
+        return 0
+    fi
+
+    if [[ ! -f "$QEMU_PCBIOS_DIR/ast27x0_bootrom.bin" ]]; then
+        error "AST2700 bootrom not found in pc-bios directory: $QEMU_PCBIOS_DIR/ast27x0_bootrom.bin"
+        error "Provide the pc-bios directory itself, or a QEMU root directory that contains pc-bios/."
+        exit 1
     fi
 }
 
@@ -597,6 +990,7 @@ resolve_qb_vars() {
 
     QB_MACHINE_NAME=""
     QB_MEM_SIZE_FLAG=""
+    QB_SYSTEM_NAME=""
 
     # Extract QB_MACHINE
     local qb_machine_raw
@@ -609,16 +1003,15 @@ resolve_qb_vars() {
     qb_machine_raw="${qb_machine_raw%\'}"
 
     if [[ -z "$qb_machine_raw" ]]; then
-        error "QB_MACHINE not defined for machine '$MACHINE'."
-        error "Add 'QB_MACHINE:$MACHINE = \"-machine <qemu-machine-name>\"' to your machine conf."
-        exit 1
-    fi
-
-    # Extract the machine name from "-machine <name>"
-    QB_MACHINE_NAME=$(echo "$qb_machine_raw" | sed 's/^-machine[[:space:]]*//' | awk '{print $1}')
-    if [[ -z "$QB_MACHINE_NAME" ]]; then
-        error "Could not parse QEMU machine name from QB_MACHINE='$qb_machine_raw'."
-        exit 1
+        warn "QB_MACHINE not defined for machine '$MACHINE' — will derive from machine name or SoC fallback."
+        QB_MACHINE_NAME=""
+    else
+        # Extract the machine name from "-machine <name>"
+        QB_MACHINE_NAME=$(echo "$qb_machine_raw" | sed 's/^-machine[[:space:]]*//' | awk '{print $1}')
+        if [[ -z "$QB_MACHINE_NAME" ]]; then
+            warn "Could not parse QEMU machine name from QB_MACHINE='$qb_machine_raw' — will use fallback."
+            QB_MACHINE_NAME=""
+        fi
     fi
 
     # Extract QB_MEM
@@ -631,15 +1024,203 @@ resolve_qb_vars() {
     qb_mem_raw="${qb_mem_raw%\'}"
 
     if [[ -z "$qb_mem_raw" ]]; then
-        error "QB_MEM not defined for machine '$MACHINE'."
-        error "Add 'QB_MEM:$MACHINE = \"-m <size>\"' to your machine conf."
-        exit 1
+        verbose "QB_MEM not defined for machine '$MACHINE' — QEMU will use default memory."
+        QB_MEM_SIZE_FLAG=""
+    else
+        QB_MEM_SIZE_FLAG="$qb_mem_raw"
     fi
 
-    QB_MEM_SIZE_FLAG="$qb_mem_raw"
+    # Extract QB_SYSTEM_NAME (qemu-system-arm | qemu-system-aarch64)
+    local qb_system_raw
+    qb_system_raw=$(echo "$bitbake_output" | grep '^QB_SYSTEM_NAME=' | head -1 | cut -d= -f2-)
+    qb_system_raw=$(trim_whitespace "$qb_system_raw")
+    qb_system_raw="${qb_system_raw#\"}"
+    qb_system_raw="${qb_system_raw%\"}"
+    qb_system_raw="${qb_system_raw#\'}"
+    qb_system_raw="${qb_system_raw%\'}"
+
+    if [[ -z "$qb_system_raw" ]]; then
+        warn "QB_SYSTEM_NAME not defined for machine '$MACHINE' — will detect from SoC fallback."
+        QB_SYSTEM_NAME=""
+    else
+        QB_SYSTEM_NAME="$qb_system_raw"
+    fi
 
     verbose "  QB_MACHINE → -machine $QB_MACHINE_NAME"
     verbose "  QB_MEM → $QB_MEM_SIZE_FLAG"
+    verbose "  QB_SYSTEM_NAME → $QB_SYSTEM_NAME"
+}
+
+resolve_machine_conf_include() {
+    local current_file="$1"
+    local include_spec="$2"
+
+    if [[ -z "$include_spec" ]]; then
+        return 1
+    fi
+
+    if [[ "$include_spec" == /* && -f "$include_spec" ]]; then
+        echo "$include_spec"
+        return 0
+    fi
+
+    local layer_root="${current_file%%/conf/*}"
+    if [[ -n "$layer_root" && -f "$layer_root/$include_spec" ]]; then
+        echo "$layer_root/$include_spec"
+        return 0
+    fi
+
+    find "$OPENBMC_DIR" -path "*/$include_spec" -type f 2>/dev/null | head -1
+}
+
+machine_conf_chain_contains() {
+    local start_file="$1"
+    local pattern="$2"
+
+    [[ -f "$start_file" ]] || return 1
+
+    local -a queue=("$start_file")
+    local -a seen=()
+
+    while [[ ${#queue[@]} -gt 0 ]]; do
+        local current="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        [[ -f "$current" ]] || continue
+
+        local canonical=""
+        canonical=$(readlink -f "$current" 2>/dev/null || echo "$current")
+
+        local visited=0
+        local seen_file
+        for seen_file in "${seen[@]}"; do
+            if [[ "$seen_file" == "$canonical" ]]; then
+                visited=1
+                break
+            fi
+        done
+        if [[ "$visited" -eq 1 ]]; then
+            continue
+        fi
+        seen+=("$canonical")
+
+        if grep -Eq "$pattern" "$current" 2>/dev/null; then
+            return 0
+        fi
+
+        while IFS= read -r include_spec; do
+            local resolved_include=""
+            resolved_include=$(resolve_machine_conf_include "$current" "$include_spec")
+            if [[ -n "$resolved_include" ]]; then
+                queue+=("$resolved_include")
+            fi
+        done < <(
+            sed -nE 's/^[[:space:]]*(require|include)[[:space:]]+([^[:space:]#]+).*$/\2/p' "$current" 2>/dev/null
+        )
+    done
+
+    return 1
+}
+
+# ──────────────────────────────────────────────
+# SoC Detection (AST2700 / AST2600)
+# ──────────────────────────────────────────────
+
+detect_soc_type() {
+    # 1. If QB_SYSTEM_NAME already set by bitbake, infer directly
+    if [[ -n "$QB_SYSTEM_NAME" ]]; then
+        case "$QB_SYSTEM_NAME" in
+            qemu-system-aarch64) SOC_TYPE="ast2700" ;;
+            qemu-system-arm)     SOC_TYPE="ast2600" ;;
+            *)
+                warn "Unknown QB_SYSTEM_NAME '$QB_SYSTEM_NAME' — cannot infer SoC type."
+                SOC_TYPE=""
+                ;;
+        esac
+        if [[ -n "$SOC_TYPE" ]]; then
+            verbose "SoC detected from QB_SYSTEM_NAME: $SOC_TYPE"
+            return 0
+        fi
+    fi
+
+    # 2. Deploy directory file detection
+    local deploy_dir="$BUILD_DIR/tmp/deploy/images/$MACHINE"
+    local deploy_hint=""
+    if [[ -d "$deploy_dir" ]]; then
+        if [[ -f "$deploy_dir/bl31-ast2700.bin" ]]; then
+            deploy_hint="ast2700"
+        else
+            deploy_hint="ast2600"
+        fi
+    fi
+    verbose "SoC deploy hint: ${deploy_hint:-<none>} (from $deploy_dir)"
+
+    # 3. Machine conf include chain detection
+    local conf_hint=""
+    local machine_conf=""
+    machine_conf=$(find "$OPENBMC_DIR" -path "*/conf/machine/$MACHINE.conf" -type f 2>/dev/null | head -1 || true)
+
+    if [[ -n "$machine_conf" && -f "$machine_conf" ]]; then
+        if machine_conf_chain_contains "$machine_conf" 'ast2700-sdk\.inc|ast2700[^[:space:]#]*\.inc'; then
+            conf_hint="ast2700"
+        elif machine_conf_chain_contains "$machine_conf" 'ast2600[^[:space:]#]*\.inc|ast2600-default'; then
+            conf_hint="ast2600"
+        fi
+    fi
+    verbose "SoC conf hint: ${conf_hint:-<none>} (from machine conf include chain)"
+
+    # 4. Cross-validate
+    if [[ -n "$deploy_hint" && -n "$conf_hint" && "$deploy_hint" != "$conf_hint" ]]; then
+        error "SoC type conflict: deploy dir says '$deploy_hint', machine conf says '$conf_hint'"
+        error "Resolve the mismatch before continuing."
+        exit 1
+    fi
+
+    # 5. Determine SOC_TYPE
+    if [[ -n "$deploy_hint" ]]; then
+        SOC_TYPE="$deploy_hint"
+    elif [[ -n "$conf_hint" ]]; then
+        SOC_TYPE="$conf_hint"
+    else
+        error "Cannot determine SoC type for machine '$MACHINE'."
+        error "Neither QB_SYSTEM_NAME, deploy artifacts, nor machine conf provide SoC information."
+        exit 1
+    fi
+
+    # 6. Backfill QB_SYSTEM_NAME if still empty
+    if [[ -z "$QB_SYSTEM_NAME" ]]; then
+        case "$SOC_TYPE" in
+            ast2700) QB_SYSTEM_NAME="qemu-system-aarch64" ;;
+            ast2600) QB_SYSTEM_NAME="qemu-system-arm" ;;
+        esac
+        verbose "Backfilled QB_SYSTEM_NAME=$QB_SYSTEM_NAME from SoC detection"
+    fi
+
+    info "SoC detected: $SOC_TYPE (arch: $QB_SYSTEM_NAME)"
+}
+
+# ──────────────────────────────────────────────
+# QEMU Machine Name Derivation
+# ──────────────────────────────────────────────
+
+derive_qemu_machine_name() {
+    # If QB_MACHINE_NAME already resolved from bitbake, use it directly
+    if [[ -n "$QB_MACHINE_NAME" ]]; then
+        verbose "QEMU machine name from QB_MACHINE: $QB_MACHINE_NAME"
+        return 0
+    fi
+
+    # Fallback: extract first segment before '-' and append '-bmc'
+    # e.g. b865g8-bytedance → b865g8-bmc, k709g8-bytedance → k709g8-bmc
+    local prefix="${MACHINE%%-*}"
+    if [[ "$prefix" == "$MACHINE" ]]; then
+        error "Cannot derive QEMU machine name from '$MACHINE' (no '-' separator)."
+        error "Define QB_MACHINE in your machine conf, or use a machine name with 'xxx-yyy' format."
+        exit 1
+    fi
+
+    QB_MACHINE_NAME="${prefix}-bmc"
+    info "QEMU machine name derived: $QB_MACHINE_NAME (from machine '$MACHINE')"
 }
 
 check_ports_available() {
@@ -681,6 +1262,110 @@ check_ports_available() {
         echo "    export OB_QEMU_IPMI_PORT=<port>"
         exit 1
     fi
+}
+
+get_port_occupants() {
+    local proto="$1"
+    local port="$2"
+
+    if [[ "$proto" == "tcp" ]]; then
+        ss -tlnpH "sport = :$port" 2>/dev/null | grep -v "^State" || true
+    else
+        ss -ulnpH "sport = :$port" 2>/dev/null | grep -v "^State" || true
+    fi
+}
+
+prompt_for_available_port() {
+    local port_var_name="$1"
+    local service_label="$2"
+    local proto="$3"
+    shift 3
+
+    local -n port_ref="$port_var_name"
+    local -a reserved_ports=("$@")
+
+    while true; do
+        local reserved_port=""
+        local candidate
+        for candidate in "${reserved_ports[@]}"; do
+            if [[ -n "$candidate" && "$candidate" == "$port_ref" ]]; then
+                reserved_port="$candidate"
+                break
+            fi
+        done
+
+        local occupants=""
+        occupants=$(get_port_occupants "$proto" "$port_ref")
+
+        if [[ -z "$reserved_port" && -z "$occupants" ]]; then
+            return 0
+        fi
+
+        if [[ ! -t 0 ]]; then
+            return 1
+        fi
+
+        echo ""
+        if [[ -n "$reserved_port" ]]; then
+            warn "$service_label port $port_ref/$proto conflicts with another requested $proto port."
+        else
+            local pid_info
+            pid_info=$(echo "$occupants" | head -1 | grep -oP 'pid=\K[0-9]+' | head -1 || echo "?")
+            warn "$service_label port $port_ref/$proto is already in use by process $pid_info."
+        fi
+
+        local input_port=""
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Enter new $service_label $proto port: ")" input_port; then
+            error "Unable to read port from stdin."
+            exit 1
+        fi
+        input_port=$(trim_whitespace "$input_port")
+
+        if [[ -z "$input_port" ]]; then
+            error "$service_label port cannot be empty."
+            continue
+        fi
+
+        if [[ ! "$input_port" =~ ^[0-9]+$ ]]; then
+            error "$service_label port must be a number: $input_port"
+            continue
+        fi
+
+        if (( input_port < 1 || input_port > 65535 )); then
+            error "$service_label port must be between 1 and 65535: $input_port"
+            continue
+        fi
+
+        port_ref="$input_port"
+    done
+}
+
+resolve_qemu_ports_interactive() {
+    local -n ssh_ref="$1"
+    local -n redfish_ref="$2"
+    local -n ipmi_ref="$3"
+    local -n http_ref="$4"
+
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+
+    if ! prompt_for_available_port ssh_ref "SSH" "tcp" "$redfish_ref" "$http_ref"; then
+        return 1
+    fi
+    if ! prompt_for_available_port redfish_ref "Redfish" "tcp" "$ssh_ref" "$http_ref"; then
+        return 1
+    fi
+    if ! prompt_for_available_port ipmi_ref "IPMI" "udp"; then
+        return 1
+    fi
+    if [[ -n "$http_ref" ]]; then
+        if ! prompt_for_available_port http_ref "HTTP" "tcp" "$ssh_ref" "$redfish_ref"; then
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 write_pid_file() {
@@ -819,12 +1504,24 @@ normalize_repo_url() {
     echo "$normalized"
 }
 
+derive_source_label() {
+    local normalized
+
+    normalized="$(normalize_repo_url "$OPENBMC_REPO_URL")"
+    if [[ "$normalized" == "github.com/openbmc/openbmc" ]]; then
+        SOURCE_LABEL="community"
+    else
+        SOURCE_LABEL="custom"
+    fi
+}
+
 write_source_lock() {
     local normalized_source
     local timestamp
 
     normalized_source="$(normalize_repo_url "$OPENBMC_REPO_URL")"
     timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    derive_source_label
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         info "[DRY-RUN] Would write source lock to $SOURCE_LOCK_FILE"
@@ -1039,7 +1736,7 @@ status_section_main_repo() {
         raw_time=$(read_lock_field created_at 2>/dev/null || true)
         if [[ -n "$raw_time" ]]; then
             # Format ISO to readable: 2026-06-06T17:13:41Z → 2026-06-06 17:13 UTC
-            first_init=$(echo "$raw_time" | sed -E 's/T([0-9]{2}:[0-9]{2}):.*/ \1 UTC/' | sed 's/Z//')
+            first_init=$(format_timestamp "$raw_time")
         fi
     fi
 
@@ -1139,7 +1836,7 @@ status_section_machines() {
             local raw_init_time
             raw_init_time=$(head -1 "$CONFIGS_DIR/$m.init-done" 2>/dev/null || true)
             if [[ -n "$raw_init_time" ]]; then
-                init_time=$(echo "$raw_init_time" | sed -E 's/T([0-9]{2}:[0-9]{2}):.*/ \1 UTC/' | sed 's/Z//')
+                init_time=$(format_timestamp "$raw_init_time")
             fi
         fi
         echo "    Init time    : ${init_time:--}"
@@ -1150,7 +1847,15 @@ status_section_machines() {
         # Image details (only when build succeeded)
         if [[ -n "${m_image[$m]:-}" ]]; then
             local build_time=""
-            build_time=$(stat -c '%Y' "${m_image[$m]}" 2>/dev/null | xargs -I{} date -u -d @{} '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "-")
+            local _bt_epoch=""
+            _bt_epoch=$(stat -c '%Y' "${m_image[$m]}" 2>/dev/null) || true
+            if [[ -n "$_bt_epoch" ]]; then
+                local _bt_iso
+                _bt_iso=$(date -u -d "@$_bt_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || true
+                build_time=$(format_timestamp "$_bt_iso")
+            else
+                build_time="-"
+            fi
             echo "    Build time   : $build_time"
             echo "    Image name   : $(basename "${m_image[$m]}")"
             echo "    Image path   : $(dirname "${m_image[$m]}")/"
@@ -1275,10 +1980,11 @@ cmd_build() {
         mname=$(basename "$init_done_file" .init-done)
         machines+=("$mname")
 
-        local init_time
-        if ! IFS= read -r init_time < "$init_done_file"; then
-            init_time="<unknown>"
+        local init_time raw_init_time
+        if ! IFS= read -r raw_init_time < "$init_done_file"; then
+            raw_init_time=""
         fi
+        init_time=$(format_timestamp "$raw_init_time")
         init_times+=("$init_time")
 
         local lockfile="$CONFIGS_DIR/$mname.lock"
@@ -1760,6 +2466,47 @@ require_openbmc_repo() {
     clone_openbmc
 }
 
+# Print "Previously initialized" separator showing init-done machines
+# with their original index from the full machine list.
+# Args:
+#   $1: machine name array (nameref)
+#   $2: CONFIGS_DIR path
+print_previously_initialized() {
+    local -n _mpi_arr="$1"
+    local _mpi_configs_dir="$2"
+
+    # Discover init-done machines
+    local -A _mpi_done=()
+    local _mpi_f _mpi_mname _mpi_raw_time _mpi_fmt_time
+    for _mpi_f in "$_mpi_configs_dir"/*.init-done; do
+        [[ -f "$_mpi_f" ]] || continue
+        _mpi_mname=$(basename "$_mpi_f" .init-done)
+        _mpi_raw_time=$(head -1 "$_mpi_f" 2>/dev/null || true)
+        _mpi_fmt_time=$(format_timestamp "$_mpi_raw_time")
+        _mpi_done["$_mpi_mname"]="$_mpi_fmt_time"
+    done
+
+    # No init-done machines → nothing to show
+    if [[ ${#_mpi_done[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    # Print separator
+    echo ""
+    echo -e "  ${YELLOW}─── Previously initialized ───${NC}"
+
+    # Match init-done machines to their index in the full list
+    local _mpi_i=0
+    local _mpi_total=${#_mpi_arr[@]}
+    local _mpi_idx_width=${#_mpi_total}
+    for _mpi_m in "${_mpi_arr[@]}"; do
+        _mpi_i=$((_mpi_i + 1))
+        if [[ -n "${_mpi_done[$_mpi_m]:-}" ]]; then
+            printf "  %${_mpi_idx_width}d) %-20s %s\n" "$_mpi_i" "$_mpi_m" "${_mpi_done[$_mpi_m]}"
+        fi
+    done
+}
+
 resolve_machine() {
     local machines
     machines=$(list_available_machines)
@@ -1773,6 +2520,7 @@ resolve_machine() {
     # Fast path: machine specified and valid
     if [[ -n "$MACHINE" ]] && echo "$machines" | grep -qx -- "$MACHINE"; then
         print_available_machines
+        print_previously_initialized machine_arr "$CONFIGS_DIR"
         info "Machine '$MACHINE' confirmed."
         return 0
     fi
@@ -1801,6 +2549,8 @@ resolve_machine() {
             printf "  %${idx_width}d) %s\n" "$i" "$m"
         done
     } | column -c "$term_cols" 2>/dev/null
+
+    print_previously_initialized machine_arr "$CONFIGS_DIR"
 
     local selected
     local chosen=""
@@ -2487,8 +3237,19 @@ cmd_start_qemu() {
         exit 3
     fi
 
+    resolve_qb_vars
+
+    # ── SoC detection (backfills QB_SYSTEM_NAME if bitbake didn't provide it) ──
+    detect_soc_type
+
+    # ── QEMU machine name derivation (QB_MACHINE → fallback to xxx-bmc) ──
+    derive_qemu_machine_name
+
     # ── Prerequisite 4: QEMU binary ──
     ensure_qemu_binary
+
+    # ── Prerequisite 4b: QEMU firmware (bootroms, etc.) ──
+    ensure_qemu_firmware
 
     # ── Prerequisite 5: image file ──
     local image_file=""
@@ -2516,7 +3277,10 @@ cmd_start_qemu() {
     redfish_port="${QEMU_REDFISH_PORT:-${OB_QEMU_REDFISH_PORT:-2443}}"
     ipmi_port="${QEMU_IPMI_PORT:-${OB_QEMU_IPMI_PORT:-2623}}"
     http_port="${QEMU_HTTP_PORT:-${OB_QEMU_HTTP_PORT:-}}"
-    serial_log="${QEMU_SERIAL_LOG:-${OB_QEMU_SERIAL_LOG:-/tmp/qemu-${MACHINE}-serial.log}}"
+    serial_log="${QEMU_SERIAL_LOG:-${OB_QEMU_SERIAL_LOG:-${HOME%/}/tmp/qemu-${MACHINE}-serial.log}}"
+
+    # ── Interactive port conflict resolution for additional QEMU instances ──
+    resolve_qemu_ports_interactive ssh_port redfish_port ipmi_port http_port
 
     # ── Prerequisite 6: port availability ──
     local -a ports_to_check=("tcp" "$ssh_port" "tcp" "$redfish_port" "udp" "$ipmi_port")
@@ -2569,147 +3333,45 @@ cmd_start_qemu() {
         fi
     fi
 
-    # ── Dispatch to source-specific implementation ──
-    local label
-    label=$(read_source_label)
-    if [[ "$label" == "community" ]]; then
-        cmd_start_qemu_community "$image_file" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
-    else
-        cmd_start_qemu_custom "$image_file" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
-    fi
-}
+    # ── Build QEMU command (SoC-specific template) ──
+    build_qemu_cmd "$image_file" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
 
-# ──────────────────────────────────────────────
-# ob start-qemu — community path
-# ──────────────────────────────────────────────
-
-cmd_start_qemu_community() {
-    local image_file="$1"
-    local ssh_port="$2"
-    local redfish_port="$3"
-    local ipmi_port="$4"
-    local http_port="$5"
-    local serial_log="$6"
-
-    # ── Resolve QB vars via bitbake -e (strict — fail if missing) ──
-    local QB_MACHINE_NAME=""
-    local QB_MEM_SIZE_FLAG=""
-    resolve_qb_vars
-
-    # ── Build port forwarding string ──
-    local hostfwd_args=""
-    hostfwd_args+="hostfwd=tcp::${ssh_port}-:22,"
-    hostfwd_args+="hostfwd=tcp::${redfish_port}-:443,"
-    hostfwd_args+="hostfwd=udp::${ipmi_port}-:623"
-    if [[ -n "$http_port" ]]; then
-        hostfwd_args+=",hostfwd=tcp::${http_port}-:80"
-    fi
-
-    step_header "Starting QEMU for '$MACHINE' (community)"
+    step_header "Starting QEMU for '$MACHINE' ($SOC_TYPE)"
     echo "  Machine   : $QB_MACHINE_NAME"
-    echo "  Memory    : $QB_MEM_SIZE_FLAG"
+    echo "  SoC       : $SOC_TYPE"
+    echo "  Binary    : $QEMU_BIN_FILE"
     echo "  Image     : $image_file"
     echo "  Serial log: $serial_log"
     echo ""
 
-    # ── Launch QEMU ──
-    local qemu_cmd=(
-        "$QEMU_BIN_FILE"
-        -machine "$QB_MACHINE_NAME"
-        $QB_MEM_SIZE_FLAG
-        -drive file="$image_file",format=raw,if=mtd
-        -net nic,netdev=net0
-        -netdev user,id=net0,"$hostfwd_args"
-        -serial file:"$serial_log"
-        -serial null
-        -monitor none
-        -daemonize
-    )
-
-    verbose "Command: setsid ${qemu_cmd[*]}"
+    verbose "Command: setsid ${QEMU_CMD[*]}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        info "[DRY-RUN] Would run: setsid ${qemu_cmd[*]}"
+        info "[DRY-RUN] Would run: setsid ${QEMU_CMD[*]}"
         exit 0
     fi
 
-    if ! setsid "${qemu_cmd[@]}" 2>/dev/null; then
+    local qemu_stderr
+    qemu_stderr=$(mktemp "${TMPDIR:-/tmp}/qemu-stderr-XXXXXX")
+    if ! setsid "${QEMU_CMD[@]}" >"$qemu_stderr" 2>&1; then
         error "QEMU failed to start."
+        local qemu_err_msg
+        qemu_err_msg=$(grep -v "^qemu-system.*: warning:" "$qemu_stderr" 2>/dev/null || true)
+        if [[ -n "$qemu_err_msg" ]]; then
+            error "$(echo "$qemu_err_msg" | head -5)"
+        fi
         error "Check serial log: $serial_log"
         error "Verify QEMU binary: $QEMU_BIN_FILE"
+        rm -f "$qemu_stderr"
         exit 1
     fi
-
-    _qemu_post_launch "$QB_MACHINE_NAME" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
-}
-
-# ──────────────────────────────────────────────
-# ob start-qemu — custom path
-# ──────────────────────────────────────────────
-
-cmd_start_qemu_custom() {
-    local image_file="$1"
-    local ssh_port="$2"
-    local redfish_port="$3"
-    local ipmi_port="$4"
-    local http_port="$5"
-    local serial_log="$6"
-
-    # ── Resolve QB vars via bitbake -e (strict — fail if missing) ──
-    local QB_MACHINE_NAME=""
-    local QB_MEM_SIZE_FLAG=""
-    resolve_qb_vars
-
-    # ── Build port forwarding string ──
-    local hostfwd_args=""
-    hostfwd_args+="hostfwd=tcp::${ssh_port}-:22,"
-    hostfwd_args+="hostfwd=tcp::${redfish_port}-:443,"
-    hostfwd_args+="hostfwd=udp::${ipmi_port}-:623"
-    if [[ -n "$http_port" ]]; then
-        hostfwd_args+=",hostfwd=tcp::${http_port}-:80"
-    fi
-
-    step_header "Starting QEMU for '$MACHINE' (custom)"
-    echo "  Machine   : $QB_MACHINE_NAME"
-    echo "  Memory    : $QB_MEM_SIZE_FLAG"
-    echo "  Image     : $image_file"
-    echo "  Serial log: $serial_log"
-    echo ""
-
-    # ── Launch QEMU ──
-    local qemu_cmd=(
-        "$QEMU_BIN_FILE"
-        -machine "$QB_MACHINE_NAME"
-        $QB_MEM_SIZE_FLAG
-        -drive file="$image_file",format=raw,if=mtd
-        -net nic,netdev=net0
-        -netdev user,id=net0,"$hostfwd_args"
-        -serial file:"$serial_log"
-        -serial null
-        -monitor none
-        -daemonize
-    )
-
-    verbose "Command: setsid ${qemu_cmd[*]}"
-
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        info "[DRY-RUN] Would run: setsid ${qemu_cmd[*]}"
-        exit 0
-    fi
-
-    if ! setsid "${qemu_cmd[@]}" 2>/dev/null; then
-        error "QEMU failed to start."
-        error "Check serial log: $serial_log"
-        error "Verify QEMU binary: $QEMU_BIN_FILE"
-        exit 1
-    fi
+    rm -f "$qemu_stderr"
 
     _qemu_post_launch "$QB_MACHINE_NAME" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
 }
 
 # ──────────────────────────────────────────────
 # Post-launch: write PID, wait, print summary
-# (shared by community and custom paths)
 # ──────────────────────────────────────────────
 
 _qemu_post_launch() {
