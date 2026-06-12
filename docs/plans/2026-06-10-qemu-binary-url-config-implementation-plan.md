@@ -8,7 +8,7 @@
 
 改造集中在单文件 `ob`，沿用现有函数组织与 `info/error/verbose/warn` 辅助、`trim_whitespace`、`normalize_repo_url`、`read_source_label`、`PROMPT_PREFIX` 等既有设施。核心：
 
-- **架构来源**：`resolve_qb_vars` 通过 `bitbake -e` 新增解析 `QB_SYSTEM_NAME`（缺失即 `exit 1`，遵循 ADR 0002 无 fallback 约定），值为 `qemu-system-arm`（AST2600，如 romulus）或 `qemu-system-aarch64`（AST2700，如 b865g8-bytedance）。
+- **架构来源**：`resolve_qb_vars` 通过 `bitbake -e` 新增解析 `QB_SYSTEM_NAME`（缺失即 `exit 1`，遵循 ADR 0002 无 fallback 约定），值为 `qemu-system-arm`（AST2600，如 romulus）或 `qemu-system-aarch64`（AST2700，如 astar-zzz）。
 - **binary 落点**：`derive_qemu_paths` 由硬编码 `qemu-bin/<source>/qemu-system-arm` 改为 `qemu-bin/<source>/<QB_SYSTEM_NAME>`，使 arm/aarch64 在同一 source 下共存。
 - **URL 配置**：新增 `qemu-binary-urls.conf`，key 为 `<source_label>.<QB_SYSTEM_NAME>`，由新增 `read_qemu_url_config` / `write_qemu_url_config`（+ `derive_qemu_url_config_path`）读写（upsert）。
 - **URL 优先级**：`ensure_qemu_binary` 重构为 env(`OB_QEMU_BINARY_URL`) > 配置文件 > 自动填（community+arm 用 jenkins 默认并写回）/ 交互输入（custom 任意架构；community+aarch64 先打印告知再走交互）。非 tty 不 `read`，改打印可执行报错；空输入干净退出。
@@ -28,7 +28,7 @@
 - 验证命令为 bash（当前环境 Linux）。`bash -n`、`grep`、`sed`、`mktemp` 可用。
 - 涉及 `bitbake -e` 的运行时验证较慢且要求对应 machine 已 `ob init`（构建环境健康）；这些标记为「运行时验证（需构建环境）」。
 - 不依赖 `bitbake` 的函数级单元测试（用 `sed` 抽函数 + `eval` 在隔离 shell 调用）是**必过门禁**，应优先执行。
-- 当前 workspace 的 OpenBMC 源是企业源（`172.17.8.200/...`），全局推导为 `custom`；故 b865g8-bytedance 与 romulus 都会走 custom 交互输入路径。community 自动填分支只有在用 `github.com/openbmc/openbmc` 源 init 的副本上才会触发。
+- 当前 workspace 的 OpenBMC 源是企业源（`git.example.com/...`），全局推导为 `custom`；故 astar-zzz 与 romulus 都会走 custom 交互输入路径。community 自动填分支只有在用 `github.com/openbmc/openbmc` 源 init 的副本上才会触发。
 
 ## 任务清单
 
@@ -85,7 +85,7 @@
 - Run:
   cd /bmc/iasi/ob-harness && eval "$(sed -n '/^normalize_repo_url() {/,/^}/p; /^derive_source_label() {/,/^}/p' ob)" && \
   OPENBMC_REPO_URL="https://github.com/openbmc/openbmc.git"; derive_source_label; echo "1 expect community: $SOURCE_LABEL"; \
-  OPENBMC_REPO_URL="git@172.17.8.200:IEC/openbmc-ami/base-tech/openbmc.git"; derive_source_label; echo "2 expect custom: $SOURCE_LABEL"; \
+  OPENBMC_REPO_URL="git@git.example.com:corp/openbmc-ami/base-tech/openbmc.git"; derive_source_label; echo "2 expect custom: $SOURCE_LABEL"; \
   OPENBMC_REPO_URL="ssh://git@git.openbmc.org/openbmc/openbmc.git"; derive_source_label; echo "3 expect custom: $SOURCE_LABEL"
 - Expected:
   1 expect community: community
@@ -164,7 +164,7 @@
 
 - 目标：从 `bitbake -e` 输出解析架构对应的 QEMU 二进制名
 - 涉及文件：`ob`（`resolve_qb_vars()` L574）
-- 验证范围：`bash -n` 通过；解析与 reset 代码就位；（运行时）b865g8 得 `qemu-system-aarch64`
+- 验证范围：`bash -n` 通过；解析与 reset 代码就位；（运行时）astar 得 `qemu-system-aarch64`
 
 - [ ] Step 1: 确认尚未解析该变量
 - Run: `grep -c 'QB_SYSTEM_NAME=' /bmc/iasi/ob-harness/ob`
@@ -191,7 +191,7 @@
 - Run: `bash -n /bmc/iasi/ob-harness/ob && grep -c 'QB_SYSTEM_NAME' /bmc/iasi/ob-harness/ob`
 - Expected: 无语法错误；计数 `>= 3`（全局声明 + reset + 解析/verbose）
 - [ ] Step 5（运行时验证，需构建环境）: 对已 init 的 machine 确认解析值
-- Run: `cd /bmc/iasi/ob-harness/workspace/openbmc && set +u; source setup b865g8-bytedance build/b865g8-bytedance >/dev/null 2>&1 && bitbake -e 2>/dev/null | grep '^QB_SYSTEM_NAME='`
+- Run: `cd /bmc/iasi/ob-harness/workspace/openbmc && set +u; source setup astar-zzz build/astar-zzz >/dev/null 2>&1 && bitbake -e 2>/dev/null | grep '^QB_SYSTEM_NAME='`
 - Expected: `QB_SYSTEM_NAME="qemu-system-aarch64"`（romulus 则为 `qemu-system-arm`）。若环境未 init，跳过本步并说明
 
 ### Task 5: `derive_qemu_paths` 按架构派生 binary 路径
@@ -366,9 +366,9 @@
 - Run: `bash -n /bmc/iasi/ob-harness/ob && echo "syntax OK"`
 - Expected: `syntax OK`
 - [ ] Step 2: 非交互报错（无 tty，配置缺失时不阻塞）。前置：确保 `workspace/qemu-bin/qemu-binary-urls.conf` 无 `custom.qemu-system-aarch64` 且无 `OB_QEMU_BINARY_URL`，binary 未缓存
-- Run: `cd /bmc/iasi/ob-harness && printf '' | ./ob start-qemu b865g8-bytedance 2>&1 | grep -i 'not configured\|OB_QEMU_BINARY_URL'; echo "exit=${PIPESTATUS[1]}"`
-- Expected: 打印「URL not configured...」可执行报错并提示 `OB_QEMU_BINARY_URL` / 配置文件路径（注：此步要求 b865g8 已 init 且 `resolve_qb_vars` 能跑通；若未 init，跳过并说明）
-- [ ] Step 3（交互，需 tty + 网络）: 人工对 b865g8 运行，输入可达 URL，确认下载成功且 `qemu-binary-urls.conf` 出现 `custom.qemu-system-aarch64=<URL>`；再次运行不再弹菜单。标注为人工验证项
+- Run: `cd /bmc/iasi/ob-harness && printf '' | ./ob start-qemu astar-zzz 2>&1 | grep -i 'not configured\|OB_QEMU_BINARY_URL'; echo "exit=${PIPESTATUS[1]}"`
+- Expected: 打印「URL not configured...」可执行报错并提示 `OB_QEMU_BINARY_URL` / 配置文件路径（注：此步要求 astar 已 init 且 `resolve_qb_vars` 能跑通；若未 init，跳过并说明）
+- [ ] Step 3（交互，需 tty + 网络）: 人工对 astar 运行，输入可达 URL，确认下载成功且 `qemu-binary-urls.conf` 出现 `custom.qemu-system-aarch64=<URL>`；再次运行不再弹菜单。标注为人工验证项
 - [ ] Step 4: 最终整体校验（见「最终验证」）
 
 ## 执行纪律
