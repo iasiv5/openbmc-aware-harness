@@ -63,3 +63,12 @@ Date: 2026-06-08
 🟡 Medium: [ob build 命令] `ob build` 落地：发现 `configs/<machine>.init-done` 文件列出已完成 init 的 machine，交互选择后执行 `bitbake obmc-phosphor-image`；引入 ADR 0001 记录 init-done marker 的设计决策（不复用 report.txt 或 lockfile 存在性，因为语义不匹配且有 Ctrl+C 截断风险）；machine 确认流程用三遍醒目警告 + Y/N 显式确认防止误触。
 🟡 Medium: [ob 交互菜单] `ob` 无参数运行进入 `cmd_menu()` 交互循环：init/build/status/clear/quit 五选项，首屏全 logo 后续 brand line，每个命令执行后 pause + Enter 继续；`ob init <machine>`、`ob build` 等 CLI 模式仍可用。
 🟡 Medium: [WSL 自动并行度] `detect_wsl` + `calc_parallelism`（`(MemTotal+SwapTotal)/4`，cap at nproc）写入 `BB_NUMBER_THREADS`/`PARALLEL_MAKE` 到 .inc 文件，解决 WSL swap 慢导致 OOM 的问题。
+
+Date: 2026-06-11
+
+🔴 High: [Bash strict mode 裸管道陷阱] `set -euo pipefail` 下裸管道（如 `cmd | grep -q`）中 grep 无匹配时返回 1，被 pipefail 捕获导致脚本意外退出。修复模式：用 `cmd | grep -q || true` 或 `if cmd | grep -q; then ...` 包裹。适用于所有在 strict mode 下使用管道的 Bash 脚本。
+🟡 Medium: [ob start-qemu 演进] `ob` 新增 start-qemu / stop-qemu 子命令（+925 行），经历三阶段演进：(1) 初始实现含 ADR 0002（QB 变量通过 `bitbake -e` 提取）；(2) 拆分 community（QEMU 官方二进制）与 custom（企业定制镜像）两条独立路径；(3) 多架构支持（aarch64/arm/riscv64）与 SoC 感知重构（+1134 行），通过 SoC 类型自动选择 QEMU 目标机器。
+🟡 Medium: [npm 注册表自动探测] `ob` 新增 npm registry 自动探测：读取 `npm config get registry` 并注入 BitBake `NPM_REGISTRY` 变量，替代硬编码 registry URL；新增 skill `bestpractice_05-npm_network_timeout_in_yocto.md` 记录 Yocto 编译中 npm ETIMEDOUT 的诊断与修复策略。配套实现计划 `2026-06-10-npm-registry-auto-detection-implementation-plan.md`。
+🟡 Medium: [设计文档与实施计划产出] 06-08 至 06-11 期间新增 1 篇设计文档（qemu-binary-url-config）和 5 篇实施计划（start-qemu、npm-registry、ob-init-previously-initialized、qemu-binary-url-config、qemu-custom-refactor），反映 ob 工具进入密集功能迭代期。
+🟢 Low: [init-done source_label 修复] `ob init` 写入 init-done marker 时 `source_label` 字段为空，已修复。
+🟢 Low: [Skill 致谢分离] `.claude/skills/` 下 SKILL.md 的致谢段落拆至独立 ATTRIBUTIONS.md，精简 skill 文档主体。

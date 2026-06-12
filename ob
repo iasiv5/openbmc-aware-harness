@@ -24,6 +24,27 @@ STATUS_MIRROR_NEW=()
 STATUS_MIRROR_EXISTING=()
 MIRROR_BASE=""
 
+# QEMU-related (start-qemu / stop-qemu)
+QEMU_SSH_PORT=""
+QEMU_REDFISH_PORT=""
+QEMU_IPMI_PORT=""
+QEMU_HTTP_PORT=""
+QEMU_SERIAL_LOG=""
+QEMU_NO_WAIT=0
+QEMU_FORCE=0
+QEMU_STOP_ALL=0
+QEMU_BIN_DIR=""       # derived: workspace/qemu-bin/<source>
+QEMU_BIN_FILE=""      # derived: workspace/qemu-bin/<source>/<QB_SYSTEM_NAME>
+QEMU_PIDS_DIR=""      # derived: workspace/qemu-bin/.pids
+QEMU_PID_FILE=""      # derived: workspace/qemu-bin/.pids/<machine>.pid
+
+# QEMU QB vars (resolved via bitbake -e) + binary URL config
+QB_MACHINE_NAME=""        # derived: <name> from "-machine <name>"
+QB_MEM_SIZE_FLAG=""       # derived: "-m <size>"
+QB_SYSTEM_NAME=""         # derived: qemu-system-arm | qemu-system-aarch64
+QEMU_URL_CONFIG_FILE=""   # derived: workspace/qemu-bin/qemu-binary-urls.conf
+QEMU_PCBIOS_DIR=""        # derived: workspace/qemu-bin/<source>/pc-bios
+
 # === Colors ===
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,6 +66,28 @@ trim_whitespace() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     echo "$value"
+}
+
+# Convert ISO 8601 UTC timestamp to local display format (UTC+8).
+# Input:  "2026-06-06T17:13:41Z" or empty/unparseable
+# Output: "2026-06-07 01:13 UTC+8" or "<unknown>"
+format_timestamp() {
+    local raw="$1"
+
+    if [[ -z "$raw" ]]; then
+        echo "<unknown>"
+        return 0
+    fi
+
+    # date -d understands ISO 8601 with trailing Z as UTC.
+    # On a UTC+8 system, it automatically converts to local time.
+    local ts_local
+    ts_local=$(date -d "$raw" '+%Y-%m-%d %H:%M UTC+8' 2>/dev/null) || {
+        echo "<unknown>"
+        return 0
+    }
+
+    echo "$ts_local"
 }
 
 read_local_conf_var() {
@@ -178,6 +221,23 @@ resolve_effective_dl_dir() {
     echo "$dl_dir"
 }
 
+resolve_effective_sstate_dir() {
+    local local_conf="$BUILD_DIR/conf/local.conf"
+    local default_sstate_dir="$WORKSPACE_DIR/sstate-cache"
+    local sstate_dir=""
+
+    # 1. Try reading SSTATE_DIR from local.conf
+    sstate_dir=$(read_local_conf_var "$local_conf" "SSTATE_DIR" 2>/dev/null || true)
+    sstate_dir=$(trim_whitespace "$sstate_dir")
+
+    # 2. Fall back to harness default if not configured
+    if [[ -z "$sstate_dir" ]]; then
+        sstate_dir="$default_sstate_dir"
+    fi
+
+    echo "$sstate_dir"
+}
+
 derive_bitbake_git_mirror_path() {
     local reference_root="$1"
     local src_uri="$2"
@@ -262,21 +322,49 @@ Usage: ob [command] [options] [arguments]
 Run without arguments to enter interactive menu mode.
 
 Commands:
-  init   [<machine>]    One-click initialize OpenBMC dev environment
-  build                 Select an initialized machine and build its image
-  status                Show current OpenBMC source binding status
+  init         [<machine>]    One-click initialize OpenBMC dev environment
+  build                        Select an initialized machine and build its image
+  status                       Show current OpenBMC source binding status
+  start-qemu   [<machine>]    Launch QEMU with built BMC image
+  stop-qemu    [<machine>]    Stop a running QEMU instance
 
-Options:
+Global Options:
   -d, --dry-run         Print actions without executing
   -u, --url <url>       Use a custom OpenBMC repository URL
   -v, --verbose         Verbose output
   -h, --help            Show this help
+
+start-qemu Options:
+  --ssh-port <port>       SSH port forwarding    (default: 2222)
+  --redfish-port <port>   Redfish port forwarding (default: 2443)
+  --ipmi-port <port>      IPMI port forwarding    (default: 2623, UDP)
+  --http-port <port>      HTTP port forwarding    (no default; set to enable)
+  --serial-log <path>     Serial log file path    (default: ~/tmp/qemu-<machine>-serial.log)
+  --no-wait               Don't wait for BMC to become ready
+  --force                 Kill existing instance without confirmation
+
+stop-qemu Options:
+  --force                 Stop without confirmation
+  --all                   Stop all running QEMU instances
+
+Environment Variables (lower priority than command-line options):
+  OB_QEMU_SSH_PORT        SSH port override
+  OB_QEMU_REDFISH_PORT    Redfish port override
+  OB_QEMU_IPMI_PORT       IPMI port override
+  OB_QEMU_HTTP_PORT       HTTP port override
+  OB_QEMU_SERIAL_LOG      Serial log path override
+  OB_QEMU_BINARY_URL      Custom QEMU binary download URL
+  OB_NPM_REGISTRY         Override npm registry URL (set empty to disable auto-detection)
 
 Examples:
   ob init                          # List machines and choose interactively
   ob init romulus                  # Initialize romulus machine
   ob init romulus -d               # Preview what would be done
   ob init romulus --url https://example.com/openbmc.git
+  ob start-qemu romulus            # Launch romulus in QEMU
+  ob start-qemu romulus --ssh-port 22223
+  ob stop-qemu romulus             # Stop romulus QEMU instance
+  ob stop-qemu --all               # Stop all running instances
 EOF
 }
 
@@ -311,6 +399,18 @@ parse_args() {
         build)
             # No arguments accepted for build
             ;;
+        start-qemu)
+            if [[ $# -gt 0 ]] && [[ "$1" != -* ]]; then
+                MACHINE="$1"
+                shift
+            fi
+            ;;
+        stop-qemu)
+            if [[ $# -gt 0 ]] && [[ "$1" != -* ]]; then
+                MACHINE="$1"
+                shift
+            fi
+            ;;
         *)
             error "Unknown command: $COMMAND"
             usage
@@ -333,10 +433,1259 @@ parse_args() {
                 ;;
             -v|-V|--verbose)  VERBOSE=1; shift ;;
             -h|-H|--help)     usage; exit 0 ;;
+            --ssh-port)
+                if [[ $# -lt 2 ]]; then error "Missing value for --ssh-port"; exit 1; fi
+                QEMU_SSH_PORT="$2"; shift 2 ;;
+            --redfish-port)
+                if [[ $# -lt 2 ]]; then error "Missing value for --redfish-port"; exit 1; fi
+                QEMU_REDFISH_PORT="$2"; shift 2 ;;
+            --ipmi-port)
+                if [[ $# -lt 2 ]]; then error "Missing value for --ipmi-port"; exit 1; fi
+                QEMU_IPMI_PORT="$2"; shift 2 ;;
+            --http-port)
+                if [[ $# -lt 2 ]]; then error "Missing value for --http-port"; exit 1; fi
+                QEMU_HTTP_PORT="$2"; shift 2 ;;
+            --serial-log)
+                if [[ $# -lt 2 ]]; then error "Missing value for --serial-log"; exit 1; fi
+                QEMU_SERIAL_LOG="$2"; shift 2 ;;
+            --no-wait)  QEMU_NO_WAIT=1; shift ;;
+            --force)    QEMU_FORCE=1; shift ;;
+            --all)      QEMU_STOP_ALL=1; shift ;;
             *)             error "Unknown option: $1"; usage; exit 1 ;;
         esac
     done
 }
+
+# ──────────────────────────────────────────────
+# QEMU Helper Functions
+# ──────────────────────────────────────────────
+
+read_source_label() {
+    local label=""
+    if [[ -f "$SOURCE_LOCK_FILE" ]]; then
+        label=$(read_lock_field source_label 2>/dev/null || true)
+        label=$(trim_whitespace "$label")
+    fi
+    if [[ -z "$label" ]]; then
+        label="community"
+    fi
+    echo "$label"
+}
+
+derive_qemu_paths() {
+    local label arch
+    label=$(read_source_label)
+    arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+    QEMU_BIN_DIR="$WORKSPACE_DIR/qemu-bin/$label"
+    QEMU_BIN_FILE="$QEMU_BIN_DIR/$arch"
+    QEMU_PIDS_DIR="$WORKSPACE_DIR/qemu-bin/.pids"
+    QEMU_PID_FILE="$QEMU_PIDS_DIR/${MACHINE}.pid"
+}
+
+derive_qemu_url_config_path() {
+    QEMU_URL_CONFIG_FILE="$WORKSPACE_DIR/qemu-bin/qemu-binary-urls.conf"
+}
+
+read_qemu_url_config() {
+    local source="$1"
+    local arch="$2"
+    local key
+    local key_re
+    local url
+
+    key="${source}.${arch}"
+    key_re="${key//./\\.}"
+    derive_qemu_url_config_path
+
+    [[ -f "$QEMU_URL_CONFIG_FILE" ]] || return 0
+
+    url=$(grep "^${key_re}=" "$QEMU_URL_CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+    trim_whitespace "$url"
+}
+
+write_qemu_url_config() {
+    local source="$1"
+    local arch="$2"
+    local url="$3"
+    local key
+    local key_re
+    local tmp
+
+    key="${source}.${arch}"
+    key_re="${key//./\\.}"
+    derive_qemu_url_config_path
+
+    mkdir -p "$(dirname "$QEMU_URL_CONFIG_FILE")"
+    if [[ ! -f "$QEMU_URL_CONFIG_FILE" ]]; then
+        echo "# qemu binary download URLs — auto-managed by 'ob start-qemu'" > "$QEMU_URL_CONFIG_FILE"
+        echo "# key: <source_label>.<QB_SYSTEM_NAME>" >> "$QEMU_URL_CONFIG_FILE"
+    fi
+
+    if grep -q "^${key_re}=" "$QEMU_URL_CONFIG_FILE"; then
+        tmp=$(mktemp "${TMPDIR:-/tmp}/qemu-url-conf-XXXXXX")
+        grep -v "^${key_re}=" "$QEMU_URL_CONFIG_FILE" > "$tmp"
+        echo "${key}=${url}" >> "$tmp"
+        mv "$tmp" "$QEMU_URL_CONFIG_FILE"
+    else
+        echo "${key}=${url}" >> "$QEMU_URL_CONFIG_FILE"
+    fi
+}
+
+write_qemu_binary_manifest() {
+    local install_source="$1"
+    local arch="$2"
+    local source_key="$3"
+    local source_value="$4"
+    local sha256="$5"
+    local build_number="${6:-}"
+    local manifest_path="${QEMU_BIN_FILE}.manifest"
+
+    cat > "$manifest_path" <<MANIFEST_EOF
+asset=binary
+source=${install_source}
+arch=${arch}
+binary_path=${QEMU_BIN_FILE}
+${source_key}=${source_value}
+installed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+sha256=${sha256}
+MANIFEST_EOF
+
+    if [[ -n "$build_number" ]]; then
+        echo "build_number=${build_number}" >> "$manifest_path"
+    fi
+}
+
+write_qemu_pcbios_manifest() {
+    local install_source="$1"
+    local pcbios_source_path="$2"
+    local manifest_path="$QEMU_BIN_DIR/pc-bios.manifest"
+
+    cat > "$manifest_path" <<MANIFEST_EOF
+asset=pc-bios
+source=${install_source}
+pcbios_path=${QEMU_BIN_DIR}/pc-bios
+pcbios_source=${pcbios_source_path}
+installed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+MANIFEST_EOF
+}
+
+# Query Jenkins lastSuccessfulBuild number for a given job URL.
+# Args: $1 = Jenkins job base URL (e.g. https://jenkins.openbmc.org/job/latest-qemu-x86)
+# Returns: build number via stdout (empty string on failure)
+query_jenkins_build_number() {
+    local job_url="$1"
+    local api_url="${job_url}/lastSuccessfulBuild/api/json?tree=number"
+    local raw
+    raw=$(curl -s --max-time 5 "$api_url" 2>/dev/null) || return 0
+    echo "$raw" | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2
+}
+
+# Download a new QEMU binary and safely replace the existing one.
+# Args: $1 = download URL, $2 = remote build number, $3 = arch
+# Returns: 0 on success, 1 on failure (caller should continue with old binary)
+download_and_replace_community_qemu() {
+    local qemu_url="$1"
+    local remote_build="$2"
+    local arch="$3"
+    local manifest="${QEMU_BIN_FILE}.manifest"
+
+    # ── flock: prevent concurrent updates ──
+    local lock_file="${QEMU_BIN_FILE}.update.lock"
+    exec 200>"$lock_file"
+    if ! flock -n 200; then
+        warn "Another QEMU binary update is in progress. Skipping."
+        exec 200>&-
+        return 1
+    fi
+
+    # ── Download to fixed partial path (supports resume) ──
+    local tmp_download="${QEMU_BIN_DIR}/.update-partial-${arch}"
+    local tmp_dir
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/qemu-update-XXXXXX")
+
+    info "Downloading QEMU binary (build #${remote_build})..."
+    verbose "  URL: $qemu_url"
+
+    if ! curl -fSL -C - -o "$tmp_download" "$qemu_url"; then
+        warn "Failed to download QEMU binary from: $qemu_url"
+        warn "Partial download kept at: $tmp_download (retry will resume)"
+        rm -rf "$tmp_dir"
+        flock -u 200 2>/dev/null; exec 200>&-
+        return 1
+    fi
+
+    # ── Extract / locate binary ──
+    local new_binary=""
+    local file_type
+    file_type=$(file -b "$tmp_download" 2>/dev/null || echo "")
+
+    if echo "$file_type" | grep -qi "gzip\|xz"; then
+        verbose "  Detected archive, extracting..."
+        tar xf "$tmp_download" -C "$tmp_dir/" --strip-components=1 2>/dev/null \
+            || tar xf "$tmp_download" -C "$tmp_dir/" 2>/dev/null
+        rm -f "$tmp_download"
+
+        for candidate in "$tmp_dir/$arch" "$tmp_dir/bin/$arch"; do
+            if [[ -f "$candidate" ]]; then
+                new_binary="$candidate"
+                break
+            fi
+        done
+
+        if [[ -z "$new_binary" ]]; then
+            warn "Could not find $arch in extracted archive."
+            rm -rf "$tmp_dir"
+            flock -u 200 2>/dev/null; exec 200>&-
+            return 1
+        fi
+    else
+        new_binary="$tmp_download"
+    fi
+
+    # ── Verify new binary ──
+    chmod +x "$new_binary"
+    if ! [[ -x "$new_binary" ]]; then
+        warn "Downloaded file is not executable."
+        rm -rf "$tmp_dir"
+        flock -u 200 2>/dev/null; exec 200>&-
+        return 1
+    fi
+
+    local new_sha256
+    new_sha256=$(sha256sum "$new_binary" | awk '{print $1}')
+
+    # ── Backup old binary ──
+    local old_build
+    old_build=$(grep '^build_number=' "$manifest" 2>/dev/null | cut -d= -f2)
+    local bak_suffix="${old_build:-unknown}"
+    local bak_file="${QEMU_BIN_FILE}-${bak_suffix}.bak"
+
+    info "Backing up current QEMU binary (build #${bak_suffix})..."
+    cp "$QEMU_BIN_FILE" "$bak_file"
+
+    # ── Replace ──
+    if ! mv "$new_binary" "$QEMU_BIN_FILE"; then
+        warn "Failed to replace QEMU binary."
+        if [[ -f "$bak_file" ]]; then
+            mv "$bak_file" "$QEMU_BIN_FILE"
+        fi
+        rm -rf "$tmp_dir"
+        flock -u 200 2>/dev/null; exec 200>&-
+        return 1
+    fi
+    chmod +x "$QEMU_BIN_FILE"
+
+    # ── Update manifest ──
+    local label
+    label=$(read_source_label)
+    write_qemu_binary_manifest "$label" "$arch" "url" "$qemu_url" "$new_sha256" "$remote_build"
+
+    # ── Cleanup ──
+    rm -rf "$tmp_dir"
+    rm -f "$bak_file"
+    flock -u 200 2>/dev/null; exec 200>&-
+
+    info "QEMU binary updated to build #${remote_build}."
+    verbose "  SHA256: $new_sha256"
+    return 0
+}
+
+# Check if a newer QEMU binary is available on Jenkins.
+# If update available and interactive, prompt user to update.
+# Non-interactive: notify only.
+# On any failure: silently continue with existing binary.
+check_jenkins_update() {
+    local manifest="${QEMU_BIN_FILE}.manifest"
+
+    # ── Guard: manifest must exist ──
+    [[ -f "$manifest" ]] || return 0
+
+    # ── Guard: build_number must be present ──
+    local local_build
+    local_build=$(grep '^build_number=' "$manifest" 2>/dev/null | cut -d= -f2)
+    [[ -z "$local_build" ]] && return 0
+
+    # ── Guard: URL must be Jenkins ──
+    local manifest_url
+    manifest_url=$(grep '^url=' "$manifest" 2>/dev/null | cut -d= -f2-)
+    [[ "$manifest_url" != *"jenkins.openbmc.org"* ]] && return 0
+
+    # ── Guard: extract job URL ──
+    local job_url
+    job_url=$(echo "$manifest_url" | sed -E 's|/lastSuccessfulBuild/.*||; s|/artifact/.*||')
+
+    # ── Query Jenkins ──
+    local remote_build
+    remote_build=$(query_jenkins_build_number "$job_url")
+    [[ -z "$remote_build" ]] && return 0  # Jenkins unreachable
+
+    # ── Same version? ──
+    if [[ "$remote_build" == "$local_build" ]]; then
+        verbose "QEMU binary is up to date (build #${local_build})."
+        return 0
+    fi
+
+    # ── Update available ──
+    info "QEMU binary update available: build #${local_build} → #${remote_build}"
+
+    # ── Non-interactive: notify and skip ──
+    if [[ ! -t 0 ]]; then
+        info "Update skipped: non-interactive mode. Re-run in a terminal to update."
+        return 0
+    fi
+
+    # ── Interactive confirmation ──
+    local arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+    echo ""
+    echo "============================================================"
+    echo ""
+    warn "  You are about to update community QEMU binary:  >>> build #${local_build} → #${remote_build} <<<"
+    warn "  You are about to update community QEMU binary:  >>> build #${local_build} → #${remote_build} <<<"
+    warn "  You are about to update community QEMU binary:  >>> build #${local_build} → #${remote_build} <<<"
+    echo ""
+    echo "============================================================"
+    echo ""
+    while true; do
+        local confirm
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Type (Y/y) to confirm update, (N/n) to cancel: ")" confirm; then
+            error "Unable to read confirmation from stdin."
+            return 0
+        fi
+        case "$confirm" in
+            [yY])
+                echo ""
+                if download_and_replace_community_qemu "$manifest_url" "$remote_build" "$arch"; then
+                    return 0
+                else
+                    warn "QEMU binary update failed. Continuing with existing binary."
+                    return 0
+                fi
+                ;;
+            [nN])
+                warn "Update cancelled by user."
+                return 0
+                ;;
+            *)
+                warn "Invalid input. Please type Y or N."
+                ;;
+        esac
+    done
+}
+
+ensure_qemu_binary_community() {
+    derive_qemu_paths
+
+    # Already downloaded and executable?
+    if [[ -x "$QEMU_BIN_FILE" ]]; then
+        verbose "QEMU binary already exists: $QEMU_BIN_FILE"
+        check_jenkins_update
+        return 0
+    fi
+
+    local label
+    label=$(read_source_label)
+    mkdir -p "$QEMU_BIN_DIR"
+
+    local arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+    local qemu_url=""
+
+    if [[ -n "${OB_QEMU_BINARY_URL:-}" ]]; then
+        qemu_url="$OB_QEMU_BINARY_URL"
+        write_qemu_url_config "$label" "$arch" "$qemu_url"
+    else
+        qemu_url="$(read_qemu_url_config "$label" "$arch")"
+    fi
+
+    if [[ -z "$qemu_url" ]]; then
+        if [[ "$label" == "community" && "$arch" == "qemu-system-arm" ]]; then
+            qemu_url="https://jenkins.openbmc.org/job/latest-qemu-x86/lastSuccessfulBuild/artifact/qemu/build/qemu-system-arm"
+            write_qemu_url_config "$label" "$arch" "$qemu_url"
+            info "Using OpenBMC Jenkins default QEMU URL (recorded in $QEMU_URL_CONFIG_FILE)"
+        else
+            if [[ "$label" == "community" && "$arch" == "qemu-system-aarch64" ]]; then
+                info "Community source provides no aarch64 QEMU binary."
+                info "Provide a custom download URL below, or press Enter / Ctrl-C to abort."
+            fi
+
+            derive_qemu_url_config_path
+            if [[ ! -t 0 ]]; then
+                error "QEMU binary URL not configured for '${label}.${arch}'."
+                error "Set OB_QEMU_BINARY_URL, or add a line '${label}.${arch}=<url>' to:"
+                error "  $QEMU_URL_CONFIG_FILE"
+                exit 1
+            fi
+
+            local input_url=""
+            read -r -p "$(echo -e "${PROMPT_PREFIX} Enter QEMU binary URL for ${label}.${arch}: ")" input_url || true
+            input_url="$(trim_whitespace "$input_url")"
+            if [[ -z "$input_url" ]]; then
+                info "No URL provided — aborting QEMU binary setup."
+                exit 0
+            fi
+            if [[ ! "$input_url" =~ ^https?:// ]]; then
+                error "Invalid URL (must start with http:// or https://): $input_url"
+                exit 1
+            fi
+
+            qemu_url="$input_url"
+            write_qemu_url_config "$label" "$arch" "$qemu_url"
+        fi
+    fi
+
+    info "Downloading QEMU binary..."
+    verbose "  URL: $qemu_url"
+
+    local arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+    local tmp_download="${QEMU_BIN_DIR}/.partial-${arch}"
+
+    if ! curl -fSL -C - -o "$tmp_download" "$qemu_url"; then
+        error "Failed to download QEMU binary from: $qemu_url"
+        error "Partial download kept at: $tmp_download (re-run to resume)"
+        exit 1
+    fi
+
+    # Detect file type: tarball or single binary
+    local file_type
+    file_type=$(file -b "$tmp_download" 2>/dev/null || echo "")
+
+    if echo "$file_type" | grep -qi "gzip\|xz"; then
+        # Tarball — extract
+        verbose "  Detected archive, extracting..."
+        tar xf "$tmp_download" -C "$QEMU_BIN_DIR/" --strip-components=1 2>/dev/null \
+            || tar xf "$tmp_download" -C "$QEMU_BIN_DIR/" 2>/dev/null
+        rm -f "$tmp_download"
+
+        local found_bin=""
+        for candidate in "$QEMU_BIN_DIR/$arch" "$QEMU_BIN_DIR/bin/$arch"; do
+            if [[ -f "$candidate" ]]; then
+                found_bin="$candidate"
+                break
+            fi
+        done
+
+        if [[ -z "$found_bin" ]]; then
+            error "Could not find $arch in extracted archive."
+            exit 1
+        fi
+
+        if [[ "$found_bin" != "$QEMU_BIN_FILE" ]]; then
+            mv "$found_bin" "$QEMU_BIN_FILE"
+        fi
+        chmod +x "$QEMU_BIN_FILE"
+    else
+        # Single binary
+        mv "$tmp_download" "$QEMU_BIN_FILE"
+        chmod +x "$QEMU_BIN_FILE"
+    fi
+
+    local sha256=""
+    sha256=$(sha256sum "$QEMU_BIN_FILE" | awk '{print $1}')
+
+    # Query Jenkins for build number (community source only)
+    local build_number=""
+    if [[ "$qemu_url" == *"jenkins.openbmc.org"* ]]; then
+        local job_url
+        job_url=$(echo "$qemu_url" | sed -E 's|/lastSuccessfulBuild/.*||; s|/artifact/.*||')
+        build_number=$(query_jenkins_build_number "$job_url")
+    fi
+
+    write_qemu_binary_manifest "$label" "$arch" "url" "$qemu_url" "$sha256" "$build_number"
+
+    info "QEMU binary ready: $QEMU_BIN_FILE"
+    verbose "  SHA256: $sha256"
+    if [[ -n "$build_number" ]]; then
+        verbose "  Build: #$build_number"
+    fi
+}
+
+# Dispatcher: route to community (URL download) or custom (local copy) setup
+ensure_qemu_binary() {
+    local label
+    label=$(read_source_label)
+    if [[ "$label" == "community" ]]; then
+        ensure_qemu_binary_community
+    else
+        ensure_qemu_binary_custom
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Custom QEMU Binary Setup (local path copy)
+# ──────────────────────────────────────────────
+
+ensure_qemu_binary_custom() {
+    derive_qemu_paths
+
+    # Already present and executable?
+    if [[ -x "$QEMU_BIN_FILE" ]]; then
+        verbose "QEMU binary already exists: $QEMU_BIN_FILE"
+        return 0
+    fi
+
+    # Need interactive terminal for prompts
+    if [[ ! -t 0 ]]; then
+        error "QEMU binary not found at $QEMU_BIN_FILE"
+        error "Run 'ob start-qemu $MACHINE' in an interactive terminal to set up the binary."
+        exit 1
+    fi
+
+    mkdir -p "$QEMU_BIN_DIR"
+
+    local arch="${QB_SYSTEM_NAME:-qemu-system-arm}"
+
+    # --- Step 1: QEMU binary ---
+    echo ""
+    info "QEMU binary for custom source not found."
+    echo ""
+
+    local input_binary=""
+    local resolved_binary_path=""
+    while true; do
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Enter absolute path to QEMU binary ($arch): ")" input_binary; then
+            error "Unable to read input."
+            exit 1
+        fi
+        input_binary=$(trim_whitespace "$input_binary")
+
+        if [[ -z "$input_binary" ]]; then
+            error "QEMU binary path cannot be empty."
+            continue
+        fi
+
+        if [[ "$input_binary" == -* ]]; then
+            error "QEMU binary path must be a filesystem path, not an option: $input_binary"
+            continue
+        fi
+
+        # Validate: must be absolute path
+        if [[ "$input_binary" != /* ]]; then
+            error "Must be an absolute path (starting with /). Got: $input_binary"
+            continue
+        fi
+
+        resolved_binary_path="$input_binary"
+        if [[ -d "$input_binary" ]]; then
+            resolved_binary_path="${input_binary%/}/$arch"
+            if [[ ! -f "$resolved_binary_path" ]]; then
+                error "Directory does not contain $arch: $input_binary"
+                continue
+            fi
+        elif [[ ! -f "$input_binary" ]]; then
+            error "File not found: $input_binary"
+            continue
+        fi
+
+        break
+    done
+
+    cp "$resolved_binary_path" "$QEMU_BIN_FILE"
+    chmod +x "$QEMU_BIN_FILE"
+    info "QEMU binary copied: $QEMU_BIN_FILE"
+
+    local input_pcbios=""
+    local resolved_pcbios_path=""
+    local target_pcbios="$QEMU_BIN_DIR/pc-bios"
+    if [[ "$SOC_TYPE" == "ast2700" ]]; then
+        echo ""
+
+        while true; do
+            if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Enter absolute path to pc-bios directory: ")" input_pcbios; then
+                error "Unable to read input."
+                exit 1
+            fi
+            input_pcbios=$(trim_whitespace "$input_pcbios")
+
+            if [[ -z "$input_pcbios" ]]; then
+                error "pc-bios directory path cannot be empty."
+                continue
+            fi
+
+            if [[ "$input_pcbios" == -* ]]; then
+                error "pc-bios directory path must be a filesystem path, not an option: $input_pcbios"
+                continue
+            fi
+
+            if [[ "$input_pcbios" != /* ]]; then
+                error "Must be an absolute path (starting with /). Got: $input_pcbios"
+                continue
+            fi
+
+            if [[ ! -d "$input_pcbios" ]]; then
+                error "Directory not found: $input_pcbios"
+                continue
+            fi
+
+            resolved_pcbios_path="$input_pcbios"
+            if [[ ! -f "$resolved_pcbios_path/ast27x0_bootrom.bin" ]]; then
+                if [[ -f "$resolved_pcbios_path/pc-bios/ast27x0_bootrom.bin" ]]; then
+                    resolved_pcbios_path="$resolved_pcbios_path/pc-bios"
+                else
+                    error "Directory does not contain ast27x0_bootrom.bin: $input_pcbios"
+                    error "Provide the pc-bios directory itself, or a QEMU root directory that contains pc-bios/."
+                    continue
+                fi
+            fi
+
+            break
+        done
+
+        if [[ -d "$target_pcbios" ]]; then
+            rm -rf "$target_pcbios"
+        fi
+        cp -r "$resolved_pcbios_path" "$target_pcbios"
+        info "pc-bios directory copied: $target_pcbios"
+    elif [[ -d "$target_pcbios" ]]; then
+        verbose "Keeping existing pc-bios directory for non-AST2700 machine: $target_pcbios"
+    fi
+
+    local sha256=""
+    sha256=$(sha256sum "$QEMU_BIN_FILE" | awk '{print $1}')
+
+    write_qemu_binary_manifest "custom" "$arch" "binary_source" "$resolved_binary_path" "$sha256"
+    if [[ -n "$resolved_pcbios_path" ]]; then
+        write_qemu_pcbios_manifest "custom" "$resolved_pcbios_path"
+    fi
+
+    info "QEMU binary setup complete."
+    verbose "  Binary : $QEMU_BIN_FILE"
+    verbose "  SHA256 : $sha256"
+}
+
+# ──────────────────────────────────────────────
+# AST2700 Bootloader File Detection
+# ──────────────────────────────────────────────
+
+find_ast2700_bootloaders() {
+    local deploy_dir="$BUILD_DIR/tmp/deploy/images/$MACHINE"
+
+    if [[ ! -d "$deploy_dir" ]]; then
+        error "Deploy directory not found: $deploy_dir"
+        error "Run 'ob build' for machine '$MACHINE' first."
+        exit 1
+    fi
+
+    BOOTLOADER_UBOOT_NODTB="$deploy_dir/u-boot-nodtb.bin"
+    BOOTLOADER_UBOOT_DTB="$deploy_dir/u-boot.dtb"
+    BOOTLOADER_BL31="$deploy_dir/bl31.bin"
+    BOOTLOADER_OPTEE="$deploy_dir/optee/tee-raw.bin"
+
+    # Validate each file
+    local -a missing=()
+    for desc_file in \
+        "u-boot-nodtb.bin:$BOOTLOADER_UBOOT_NODTB" \
+        "u-boot.dtb:$BOOTLOADER_UBOOT_DTB" \
+        "bl31.bin:$BOOTLOADER_BL31" \
+        "optee/tee-raw.bin:$BOOTLOADER_OPTEE"
+    do
+        local desc="${desc_file%%:*}"
+        local fpath="${desc_file#*:}"
+        if [[ ! -f "$fpath" ]]; then
+            missing+=("$desc ($fpath)")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "AST2700 bootloader files not found in deploy directory:"
+        for m in "${missing[@]}"; do
+            error "  Missing: $m"
+        done
+        error "Ensure 'ob build' completed successfully for '$MACHINE'."
+        exit 1
+    fi
+
+    # Get u-boot-nodtb.bin size for DTB load offset calculation
+    BOOTLOADER_UBOOT_SIZE=$(stat --format=%s -L "$BOOTLOADER_UBOOT_NODTB" 2>/dev/null || echo "0")
+
+    verbose "AST2700 bootloaders:"
+    verbose "  u-boot-nodtb.bin : $BOOTLOADER_UBOOT_NODTB ($BOOTLOADER_UBOOT_SIZE bytes)"
+    verbose "  u-boot.dtb       : $BOOTLOADER_UBOOT_DTB"
+    verbose "  bl31.bin         : $BOOTLOADER_BL31"
+    verbose "  tee-raw.bin      : $BOOTLOADER_OPTEE"
+}
+
+# ──────────────────────────────────────────────
+# SoC-specific QEMU Command Builder
+# ──────────────────────────────────────────────
+
+build_qemu_cmd() {
+    local image_file="$1"
+    local ssh_port="$2"
+    local redfish_port="$3"
+    local ipmi_port="$4"
+    local http_port="$5"
+    local serial_log="$6"
+
+    # Port forwarding string
+    local hostfwd_args=""
+    hostfwd_args+="hostfwd=tcp::${ssh_port}-:22,"
+    hostfwd_args+="hostfwd=tcp::${redfish_port}-:443,"
+    hostfwd_args+="hostfwd=udp::${ipmi_port}-:623"
+    if [[ -n "$http_port" ]]; then
+        hostfwd_args+=",hostfwd=tcp::${http_port}-:80"
+    fi
+
+    # Start building command array
+    QEMU_CMD=(
+        "$QEMU_BIN_FILE"
+        "-machine" "$QB_MACHINE_NAME"
+    )
+
+    # SoC-specific parameters
+    if [[ "$SOC_TYPE" == "ast2700" ]]; then
+        find_ast2700_bootloaders
+        QEMU_CMD+=(
+            "-device" "loader,force-raw=on,addr=0x400000000,file=$BOOTLOADER_UBOOT_NODTB"
+            "-device" "loader,force-raw=on,addr=$((0x400000000 + BOOTLOADER_UBOOT_SIZE)),file=$BOOTLOADER_UBOOT_DTB"
+            "-device" "loader,force-raw=on,addr=0x430000000,file=$BOOTLOADER_BL31"
+            "-device" "loader,force-raw=on,addr=0x430080000,file=$BOOTLOADER_OPTEE"
+            "-device" "loader,cpu-num=0,addr=0x430000000"
+            "-device" "loader,cpu-num=1,addr=0x430000000"
+            "-device" "loader,cpu-num=2,addr=0x430000000"
+            "-device" "loader,cpu-num=3,addr=0x430000000"
+            "-smp" "4"
+        )
+    fi
+    # AST2600: bootloader is embedded in MTD image, no extra params needed
+
+    # QB_MEM (-m flag): include only if resolved from bitbake
+    if [[ -n "$QB_MEM_SIZE_FLAG" ]]; then
+        local -a qemu_mem_args=()
+        read -r -a qemu_mem_args <<< "$QB_MEM_SIZE_FLAG"
+        QEMU_CMD+=("${qemu_mem_args[@]}")
+    fi
+
+    # Common tail: drive, network, serial, display
+    QEMU_CMD+=(
+        "-drive" "file=$image_file,format=raw,if=mtd"
+        "-net" "nic,netdev=net0"
+        "-netdev" "user,id=net0,$hostfwd_args"
+        "-serial" "file:$serial_log"
+        "-serial" "null"
+        "-monitor" "none"
+        "-display" "none"
+    )
+    if [[ -d "$QEMU_PCBIOS_DIR" ]]; then
+        QEMU_CMD+=("-L" "$QEMU_PCBIOS_DIR")
+    fi
+    QEMU_CMD+=("-daemonize")
+}
+#
+# QEMU searches for firmware files in this order (with -L <dir>):
+#   1. <cwd>/<name>
+#   2. <dir>/<name>                        (the -L path)
+#   3. <QEMU_BIN_DIR>/../share/qemu-firmware/<name>
+#   4. <QEMU_BIN_DIR>/../share/qemu/<name>
+#
+# Strategy:
+# Ensure QEMU firmware directory (pc-bios) is available.
+# For custom QEMU, the user provides pc-bios/ during binary setup.
+# For community QEMU, pc-bios/ may or may not exist — QEMU will fall back
+# to its built-in firmware paths.
+ensure_qemu_firmware() {
+    QEMU_PCBIOS_DIR="$QEMU_BIN_DIR/pc-bios"
+
+    if [[ "$SOC_TYPE" != "ast2700" ]]; then
+        return 0
+    fi
+
+    if [[ ! -d "$QEMU_PCBIOS_DIR" ]]; then
+        warn "QEMU pc-bios directory not found: $QEMU_PCBIOS_DIR"
+        warn "Custom QEMU requires pc-bios/. Ensure it was provided during binary setup."
+        return 0
+    fi
+
+    if [[ ! -f "$QEMU_PCBIOS_DIR/ast27x0_bootrom.bin" ]]; then
+        error "AST2700 bootrom not found in pc-bios directory: $QEMU_PCBIOS_DIR/ast27x0_bootrom.bin"
+        error "Provide the pc-bios directory itself, or a QEMU root directory that contains pc-bios/."
+        exit 1
+    fi
+}
+
+resolve_qb_vars() {
+    # Validate build environment exists
+    if [[ ! -d "$BUILD_DIR" ]]; then
+        error "Build directory not found: $BUILD_DIR"
+        error "Run 'ob init $MACHINE' first."
+        exit 1
+    fi
+
+    if [[ ! -f "$OPENBMC_DIR/setup" ]]; then
+        error "OpenBMC setup script not found: $OPENBMC_DIR/setup"
+        exit 1
+    fi
+
+    info "Resolving QEMU variables via BitBake (this takes a few seconds)..."
+
+    local bitbake_output
+    bitbake_output=$(cd "$OPENBMC_DIR" && set +u; source setup "$MACHINE" "$BUILD_DIR" 2>/dev/null && bitbake -e 2>/dev/null)
+
+    if [[ -z "$bitbake_output" ]]; then
+        error "Failed to run 'bitbake -e' for machine '$MACHINE'."
+        error "Ensure the build environment is healthy (try 'ob init $MACHINE' if unsure)."
+        exit 1
+    fi
+
+    QB_MACHINE_NAME=""
+    QB_MEM_SIZE_FLAG=""
+    QB_SYSTEM_NAME=""
+
+    # Extract QB_MACHINE
+    local qb_machine_raw
+    qb_machine_raw=$(echo "$bitbake_output" | grep '^QB_MACHINE=' | head -1 | cut -d= -f2-)
+    qb_machine_raw=$(trim_whitespace "$qb_machine_raw")
+    # Strip quotes
+    qb_machine_raw="${qb_machine_raw#\"}"
+    qb_machine_raw="${qb_machine_raw%\"}"
+    qb_machine_raw="${qb_machine_raw#\'}"
+    qb_machine_raw="${qb_machine_raw%\'}"
+
+    if [[ -z "$qb_machine_raw" ]]; then
+        warn "QB_MACHINE not defined for machine '$MACHINE' — will derive from machine name or SoC fallback."
+        QB_MACHINE_NAME=""
+    else
+        # Extract the machine name from "-machine <name>"
+        QB_MACHINE_NAME=$(echo "$qb_machine_raw" | sed 's/^-machine[[:space:]]*//' | awk '{print $1}')
+        if [[ -z "$QB_MACHINE_NAME" ]]; then
+            warn "Could not parse QEMU machine name from QB_MACHINE='$qb_machine_raw' — will use fallback."
+            QB_MACHINE_NAME=""
+        fi
+    fi
+
+    # Extract QB_MEM
+    local qb_mem_raw
+    qb_mem_raw=$(echo "$bitbake_output" | grep '^QB_MEM=' | head -1 | cut -d= -f2-)
+    qb_mem_raw=$(trim_whitespace "$qb_mem_raw")
+    qb_mem_raw="${qb_mem_raw#\"}"
+    qb_mem_raw="${qb_mem_raw%\"}"
+    qb_mem_raw="${qb_mem_raw#\'}"
+    qb_mem_raw="${qb_mem_raw%\'}"
+
+    if [[ -z "$qb_mem_raw" ]]; then
+        verbose "QB_MEM not defined for machine '$MACHINE' — QEMU will use default memory."
+        QB_MEM_SIZE_FLAG=""
+    else
+        QB_MEM_SIZE_FLAG="$qb_mem_raw"
+    fi
+
+    # Extract QB_SYSTEM_NAME (qemu-system-arm | qemu-system-aarch64)
+    local qb_system_raw
+    qb_system_raw=$(echo "$bitbake_output" | grep '^QB_SYSTEM_NAME=' | head -1 | cut -d= -f2-)
+    qb_system_raw=$(trim_whitespace "$qb_system_raw")
+    qb_system_raw="${qb_system_raw#\"}"
+    qb_system_raw="${qb_system_raw%\"}"
+    qb_system_raw="${qb_system_raw#\'}"
+    qb_system_raw="${qb_system_raw%\'}"
+
+    if [[ -z "$qb_system_raw" ]]; then
+        warn "QB_SYSTEM_NAME not defined for machine '$MACHINE' — will detect from SoC fallback."
+        QB_SYSTEM_NAME=""
+    else
+        QB_SYSTEM_NAME="$qb_system_raw"
+    fi
+
+    verbose "  QB_MACHINE → -machine $QB_MACHINE_NAME"
+    verbose "  QB_MEM → $QB_MEM_SIZE_FLAG"
+    verbose "  QB_SYSTEM_NAME → $QB_SYSTEM_NAME"
+}
+
+resolve_machine_conf_include() {
+    local current_file="$1"
+    local include_spec="$2"
+
+    if [[ -z "$include_spec" ]]; then
+        return 1
+    fi
+
+    if [[ "$include_spec" == /* && -f "$include_spec" ]]; then
+        echo "$include_spec"
+        return 0
+    fi
+
+    local layer_root="${current_file%%/conf/*}"
+    if [[ -n "$layer_root" && -f "$layer_root/$include_spec" ]]; then
+        echo "$layer_root/$include_spec"
+        return 0
+    fi
+
+    find "$OPENBMC_DIR" -path "*/$include_spec" -type f 2>/dev/null | head -1
+}
+
+machine_conf_chain_contains() {
+    local start_file="$1"
+    local pattern="$2"
+
+    [[ -f "$start_file" ]] || return 1
+
+    local -a queue=("$start_file")
+    local -a seen=()
+
+    while [[ ${#queue[@]} -gt 0 ]]; do
+        local current="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        [[ -f "$current" ]] || continue
+
+        local canonical=""
+        canonical=$(readlink -f "$current" 2>/dev/null || echo "$current")
+
+        local visited=0
+        local seen_file
+        for seen_file in "${seen[@]}"; do
+            if [[ "$seen_file" == "$canonical" ]]; then
+                visited=1
+                break
+            fi
+        done
+        if [[ "$visited" -eq 1 ]]; then
+            continue
+        fi
+        seen+=("$canonical")
+
+        if grep -Eq "$pattern" "$current" 2>/dev/null; then
+            return 0
+        fi
+
+        while IFS= read -r include_spec; do
+            local resolved_include=""
+            resolved_include=$(resolve_machine_conf_include "$current" "$include_spec")
+            if [[ -n "$resolved_include" ]]; then
+                queue+=("$resolved_include")
+            fi
+        done < <(
+            sed -nE 's/^[[:space:]]*(require|include)[[:space:]]+([^[:space:]#]+).*$/\2/p' "$current" 2>/dev/null
+        )
+    done
+
+    return 1
+}
+
+# ──────────────────────────────────────────────
+# SoC Detection (AST2700 / AST2600)
+# ──────────────────────────────────────────────
+
+detect_soc_type() {
+    # 1. If QB_SYSTEM_NAME already set by bitbake, infer directly
+    if [[ -n "$QB_SYSTEM_NAME" ]]; then
+        case "$QB_SYSTEM_NAME" in
+            qemu-system-aarch64) SOC_TYPE="ast2700" ;;
+            qemu-system-arm)     SOC_TYPE="ast2600" ;;
+            *)
+                warn "Unknown QB_SYSTEM_NAME '$QB_SYSTEM_NAME' — cannot infer SoC type."
+                SOC_TYPE=""
+                ;;
+        esac
+        if [[ -n "$SOC_TYPE" ]]; then
+            verbose "SoC detected from QB_SYSTEM_NAME: $SOC_TYPE"
+            return 0
+        fi
+    fi
+
+    # 2. Deploy directory file detection
+    local deploy_dir="$BUILD_DIR/tmp/deploy/images/$MACHINE"
+    local deploy_hint=""
+    if [[ -d "$deploy_dir" ]]; then
+        if [[ -f "$deploy_dir/bl31-ast2700.bin" ]]; then
+            deploy_hint="ast2700"
+        else
+            deploy_hint="ast2600"
+        fi
+    fi
+    verbose "SoC deploy hint: ${deploy_hint:-<none>} (from $deploy_dir)"
+
+    # 3. Machine conf include chain detection
+    local conf_hint=""
+    local machine_conf=""
+    machine_conf=$(find "$OPENBMC_DIR" -path "*/conf/machine/$MACHINE.conf" -type f 2>/dev/null | head -1 || true)
+
+    if [[ -n "$machine_conf" && -f "$machine_conf" ]]; then
+        if machine_conf_chain_contains "$machine_conf" 'ast2700-sdk\.inc|ast2700[^[:space:]#]*\.inc'; then
+            conf_hint="ast2700"
+        elif machine_conf_chain_contains "$machine_conf" 'ast2600[^[:space:]#]*\.inc|ast2600-default'; then
+            conf_hint="ast2600"
+        fi
+    fi
+    verbose "SoC conf hint: ${conf_hint:-<none>} (from machine conf include chain)"
+
+    # 4. Cross-validate
+    if [[ -n "$deploy_hint" && -n "$conf_hint" && "$deploy_hint" != "$conf_hint" ]]; then
+        error "SoC type conflict: deploy dir says '$deploy_hint', machine conf says '$conf_hint'"
+        error "Resolve the mismatch before continuing."
+        exit 1
+    fi
+
+    # 5. Determine SOC_TYPE
+    if [[ -n "$deploy_hint" ]]; then
+        SOC_TYPE="$deploy_hint"
+    elif [[ -n "$conf_hint" ]]; then
+        SOC_TYPE="$conf_hint"
+    else
+        error "Cannot determine SoC type for machine '$MACHINE'."
+        error "Neither QB_SYSTEM_NAME, deploy artifacts, nor machine conf provide SoC information."
+        exit 1
+    fi
+
+    # 6. Backfill QB_SYSTEM_NAME if still empty
+    if [[ -z "$QB_SYSTEM_NAME" ]]; then
+        case "$SOC_TYPE" in
+            ast2700) QB_SYSTEM_NAME="qemu-system-aarch64" ;;
+            ast2600) QB_SYSTEM_NAME="qemu-system-arm" ;;
+        esac
+        verbose "Backfilled QB_SYSTEM_NAME=$QB_SYSTEM_NAME from SoC detection"
+    fi
+
+    info "SoC detected: $SOC_TYPE (arch: $QB_SYSTEM_NAME)"
+}
+
+# ──────────────────────────────────────────────
+# QEMU Machine Name Derivation
+# ──────────────────────────────────────────────
+
+derive_qemu_machine_name() {
+    # If QB_MACHINE_NAME already resolved from bitbake, use it directly
+    if [[ -n "$QB_MACHINE_NAME" ]]; then
+        verbose "QEMU machine name from QB_MACHINE: $QB_MACHINE_NAME"
+        return 0
+    fi
+
+    # Fallback: extract first segment before '-' and append '-bmc'
+    # e.g. b865g8-bytedance → b865g8-bmc, k709g8-bytedance → k709g8-bmc
+    local prefix="${MACHINE%%-*}"
+    if [[ "$prefix" == "$MACHINE" ]]; then
+        error "Cannot derive QEMU machine name from '$MACHINE' (no '-' separator)."
+        error "Define QB_MACHINE in your machine conf, or use a machine name with 'xxx-yyy' format."
+        exit 1
+    fi
+
+    QB_MACHINE_NAME="${prefix}-bmc"
+    info "QEMU machine name derived: $QB_MACHINE_NAME (from machine '$MACHINE')"
+}
+
+check_ports_available() {
+    local -a port_args=("$@")
+    local -a conflicts=()
+
+    local i
+    for (( i=0; i<${#port_args[@]}; i+=2 )); do
+        local proto="${port_args[$i]}"   # "tcp" or "udp"
+        local port="${port_args[$((i+1))]}"
+
+        local occupants=""
+        if [[ "$proto" == "tcp" ]]; then
+            occupants=$(ss -tlnpH "sport = :$port" 2>/dev/null | grep -v "^State" || true)
+        else
+            occupants=$(ss -ulnpH "sport = :$port" 2>/dev/null | grep -v "^State" || true)
+        fi
+
+        if [[ -n "$occupants" ]]; then
+            local pid_info
+            pid_info=$(echo "$occupants" | head -1 | grep -oP 'pid=\K[0-9]+' | head -1 || echo "?")
+            conflicts+=("$proto $port — used by process $pid_info")
+        fi
+    done
+
+    if [[ ${#conflicts[@]} -gt 0 ]]; then
+        echo ""
+        error "Port(s) already in use:"
+        local c
+        for c in "${conflicts[@]}"; do
+            echo -e "  ${RED}$c${NC}"
+        done
+        echo ""
+        echo "  Set a different port:"
+        echo "    ob start-qemu $MACHINE --ssh-port <port> --redfish-port <port> --ipmi-port <port>"
+        echo "  Or export:"
+        echo "    export OB_QEMU_SSH_PORT=<port>"
+        echo "    export OB_QEMU_REDFISH_PORT=<port>"
+        echo "    export OB_QEMU_IPMI_PORT=<port>"
+        exit 1
+    fi
+}
+
+get_port_occupants() {
+    local proto="$1"
+    local port="$2"
+
+    if [[ "$proto" == "tcp" ]]; then
+        ss -tlnpH "sport = :$port" 2>/dev/null | grep -v "^State" || true
+    else
+        ss -ulnpH "sport = :$port" 2>/dev/null | grep -v "^State" || true
+    fi
+}
+
+prompt_for_available_port() {
+    local port_var_name="$1"
+    local service_label="$2"
+    local proto="$3"
+    shift 3
+
+    local -n port_ref="$port_var_name"
+    local -a reserved_ports=("$@")
+
+    while true; do
+        local reserved_port=""
+        local candidate
+        for candidate in "${reserved_ports[@]}"; do
+            if [[ -n "$candidate" && "$candidate" == "$port_ref" ]]; then
+                reserved_port="$candidate"
+                break
+            fi
+        done
+
+        local occupants=""
+        occupants=$(get_port_occupants "$proto" "$port_ref")
+
+        if [[ -z "$reserved_port" && -z "$occupants" ]]; then
+            return 0
+        fi
+
+        if [[ ! -t 0 ]]; then
+            return 1
+        fi
+
+        echo ""
+        if [[ -n "$reserved_port" ]]; then
+            warn "$service_label port $port_ref/$proto conflicts with another requested $proto port."
+        else
+            local pid_info
+            pid_info=$(echo "$occupants" | head -1 | grep -oP 'pid=\K[0-9]+' | head -1 || echo "?")
+            warn "$service_label port $port_ref/$proto is already in use by process $pid_info."
+        fi
+
+        local input_port=""
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Enter new $service_label $proto port: ")" input_port; then
+            error "Unable to read port from stdin."
+            exit 1
+        fi
+        input_port=$(trim_whitespace "$input_port")
+
+        if [[ -z "$input_port" ]]; then
+            error "$service_label port cannot be empty."
+            continue
+        fi
+
+        if [[ ! "$input_port" =~ ^[0-9]+$ ]]; then
+            error "$service_label port must be a number: $input_port"
+            continue
+        fi
+
+        if (( input_port < 1 || input_port > 65535 )); then
+            error "$service_label port must be between 1 and 65535: $input_port"
+            continue
+        fi
+
+        port_ref="$input_port"
+    done
+}
+
+resolve_qemu_ports_interactive() {
+    local -n ssh_ref="$1"
+    local -n redfish_ref="$2"
+    local -n ipmi_ref="$3"
+    local -n http_ref="$4"
+
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+
+    if ! prompt_for_available_port ssh_ref "SSH" "tcp" "$redfish_ref" "$http_ref"; then
+        return 1
+    fi
+    if ! prompt_for_available_port redfish_ref "Redfish" "tcp" "$ssh_ref" "$http_ref"; then
+        return 1
+    fi
+    if ! prompt_for_available_port ipmi_ref "IPMI" "udp"; then
+        return 1
+    fi
+    if [[ -n "$http_ref" ]]; then
+        if ! prompt_for_available_port http_ref "HTTP" "tcp" "$ssh_ref" "$redfish_ref"; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+write_pid_file() {
+    mkdir -p "$QEMU_PIDS_DIR"
+    local ssh_p="${1:-}"
+    local redfish_p="${2:-}"
+    local ipmi_p="${3:-}"
+    local http_p="${4:-}"
+    local serial_log_p="${5:-}"
+
+    cat > "$QEMU_PID_FILE" <<PIDFILE_EOF
+pid=$!
+user=$(whoami)
+machine=$MACHINE
+binary=$QEMU_BIN_FILE
+started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ssh_port=$ssh_p
+redfish_port=$redfish_p
+ipmi_port=$ipmi_p
+http_port=$http_p
+serial_log=$serial_log_p
+PIDFILE_EOF
+
+    verbose "PID file written: $QEMU_PID_FILE"
+}
+
+read_pid_file() {
+    if [[ ! -f "$QEMU_PID_FILE" ]]; then
+        return 1
+    fi
+
+    PIDFILE_PID=""
+    PIDFILE_USER=""
+    PIDFILE_MACHINE=""
+    PIDFILE_BINARY=""
+    PIDFILE_STARTED_AT=""
+    PIDFILE_SSH_PORT=""
+    PIDFILE_REDFISH_PORT=""
+    PIDFILE_IPMI_PORT=""
+    PIDFILE_HTTP_PORT=""
+    PIDFILE_SERIAL_LOG=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            pid)          PIDFILE_PID="$value" ;;
+            user)         PIDFILE_USER="$value" ;;
+            machine)      PIDFILE_MACHINE="$value" ;;
+            binary)       PIDFILE_BINARY="$value" ;;
+            started_at)   PIDFILE_STARTED_AT="$value" ;;
+            ssh_port)     PIDFILE_SSH_PORT="$value" ;;
+            redfish_port) PIDFILE_REDFISH_PORT="$value" ;;
+            ipmi_port)    PIDFILE_IPMI_PORT="$value" ;;
+            http_port)    PIDFILE_HTTP_PORT="$value" ;;
+            serial_log)   PIDFILE_SERIAL_LOG="$value" ;;
+        esac
+    done < "$QEMU_PID_FILE"
+
+    return 0
+}
+
+validate_pid() {
+    # Returns: 0=running and matches, 1=process exited, 2=PID recycled
+    local pid="$1"
+    local expected_binary="$2"
+    local expected_machine="$3"
+
+    if [[ ! -d "/proc/$pid" ]]; then
+        return 1  # Process exited
+    fi
+
+    local cmdline
+    cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+
+    if [[ "$cmdline" != *"$expected_binary"* ]] || [[ "$cmdline" != *"$expected_machine"* ]]; then
+        return 2  # PID recycled — different process
+    fi
+
+    return 0  # Running and matches
+}
+
+# ──────────────────────────────────────────────
+# End QEMU Helper Functions
+# ──────────────────────────────────────────────
 
 is_valid_repo_url() {
     local repo_url="$1"
@@ -392,12 +1741,24 @@ normalize_repo_url() {
     echo "$normalized"
 }
 
+derive_source_label() {
+    local normalized
+
+    normalized="$(normalize_repo_url "$OPENBMC_REPO_URL")"
+    if [[ "$normalized" == "github.com/openbmc/openbmc" ]]; then
+        SOURCE_LABEL="community"
+    else
+        SOURCE_LABEL="custom"
+    fi
+}
+
 write_source_lock() {
     local normalized_source
     local timestamp
 
     normalized_source="$(normalize_repo_url "$OPENBMC_REPO_URL")"
     timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    derive_source_label
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         info "[DRY-RUN] Would write source lock to $SOURCE_LOCK_FILE"
@@ -612,7 +1973,7 @@ status_section_main_repo() {
         raw_time=$(read_lock_field created_at 2>/dev/null || true)
         if [[ -n "$raw_time" ]]; then
             # Format ISO to readable: 2026-06-06T17:13:41Z → 2026-06-06 17:13 UTC
-            first_init=$(echo "$raw_time" | sed -E 's/T([0-9]{2}:[0-9]{2}):.*/ \1 UTC/' | sed 's/Z//')
+            first_init=$(format_timestamp "$raw_time")
         fi
     fi
 
@@ -712,7 +2073,7 @@ status_section_machines() {
             local raw_init_time
             raw_init_time=$(head -1 "$CONFIGS_DIR/$m.init-done" 2>/dev/null || true)
             if [[ -n "$raw_init_time" ]]; then
-                init_time=$(echo "$raw_init_time" | sed -E 's/T([0-9]{2}:[0-9]{2}):.*/ \1 UTC/' | sed 's/Z//')
+                init_time=$(format_timestamp "$raw_init_time")
             fi
         fi
         echo "    Init time    : ${init_time:--}"
@@ -723,7 +2084,15 @@ status_section_machines() {
         # Image details (only when build succeeded)
         if [[ -n "${m_image[$m]:-}" ]]; then
             local build_time=""
-            build_time=$(stat -c '%Y' "${m_image[$m]}" 2>/dev/null | xargs -I{} date -u -d @{} '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "-")
+            local _bt_epoch=""
+            _bt_epoch=$(stat -c '%Y' "${m_image[$m]}" 2>/dev/null) || true
+            if [[ -n "$_bt_epoch" ]]; then
+                local _bt_iso
+                _bt_iso=$(date -u -d "@$_bt_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || true
+                build_time=$(format_timestamp "$_bt_iso")
+            else
+                build_time="-"
+            fi
             echo "    Build time   : $build_time"
             echo "    Image name   : $(basename "${m_image[$m]}")"
             echo "    Image path   : $(dirname "${m_image[$m]}")/"
@@ -783,6 +2152,44 @@ cmd_status() {
     done
 
     status_section_tips "$repo_exists" "$has_init_done" "$has_never_built"
+
+    # Section 4: QEMU instances (only shown when instances exist)
+    local _pids_dir="$WORKSPACE_DIR/qemu-bin/.pids"
+    local _has_qemu=0
+    local -a _qemu_lines=()
+
+    for _pf in "$_pids_dir"/*.pid; do
+        [[ -f "$_pf" ]] || continue
+
+        local _qm="" _qp="" _qbin="" _qstart="" _qsport="" _qrport="" _qiport=""
+        _qm=$(basename "$_pf" .pid)
+
+        # Read PID file fields
+        _qp=$(grep '^pid=' "$_pf" 2>/dev/null | cut -d= -f2 || true)
+        _qbin=$(grep '^binary=' "$_pf" 2>/dev/null | cut -d= -f2 || true)
+        _qstart=$(grep '^started_at=' "$_pf" 2>/dev/null | cut -d= -f2 || true)
+        _qsport=$(grep '^ssh_port=' "$_pf" 2>/dev/null | cut -d= -f2 || true)
+        _qrport=$(grep '^redfish_port=' "$_pf" 2>/dev/null | cut -d= -f2 || true)
+        _qiport=$(grep '^ipmi_port=' "$_pf" 2>/dev/null | cut -d= -f2 || true)
+
+        # Validate process is alive
+        if [[ -n "$_qp" ]] && [[ -d "/proc/$_qp" ]]; then
+            _has_qemu=1
+            _qemu_lines+=("  $_qm   PID $_qp   SSH($_qsport) Redfish($_qrport) IPMI($_qiport/UDP)   ✅ running")
+        else
+            # Stale PID file — clean up silently
+            rm -f "$_pf"
+        fi
+    done
+
+    if [[ "$_has_qemu" -eq 1 ]]; then
+        echo ""
+        step_header "QEMU Instances"
+        local _ql
+        for _ql in "${_qemu_lines[@]}"; do
+            echo "$_ql"
+        done
+    fi
 }
 
 cmd_build() {
@@ -810,10 +2217,11 @@ cmd_build() {
         mname=$(basename "$init_done_file" .init-done)
         machines+=("$mname")
 
-        local init_time
-        if ! IFS= read -r init_time < "$init_done_file"; then
-            init_time="<unknown>"
+        local init_time raw_init_time
+        if ! IFS= read -r raw_init_time < "$init_done_file"; then
+            raw_init_time=""
         fi
+        init_time=$(format_timestamp "$raw_init_time")
         init_times+=("$init_time")
 
         local lockfile="$CONFIGS_DIR/$mname.lock"
@@ -928,6 +2336,25 @@ cmd_build() {
     # shellcheck disable=SC1091
     source setup "$MACHINE" "$BUILD_DIR" 2>/dev/null
     eval "$prev_opts"
+
+    # === npm registry auto-detection ===
+    resolve_npm_registry
+    if [[ "$NPM_REGISTRY_RESOLVED" != "skip" ]]; then
+        export npm_config_registry="$NPM_REGISTRY_RESOLVED"
+        export npm_config_fetch_timeout=600000
+        export npm_config_fetch_retry_maxtimeout=120000
+        export npm_config_fetch_retry_mintimeout=30000
+        export npm_config_fetch_retry_factor=2
+        local _npm_vars="npm_config_registry npm_config_fetch_timeout npm_config_fetch_retry_maxtimeout npm_config_fetch_retry_mintimeout npm_config_fetch_retry_factor"
+        local _existing="${BB_ENV_PASSTHROUGH_ADDITIONS:-}"
+        BB_ENV_PASSTHROUGH_ADDITIONS="$_npm_vars"
+        if [[ -n "$_existing" ]]; then
+            BB_ENV_PASSTHROUGH_ADDITIONS="$_existing $BB_ENV_PASSTHROUGH_ADDITIONS"
+        fi
+        export BB_ENV_PASSTHROUGH_ADDITIONS
+        verbose "Exported npm config for bitbake passthrough"
+        verbose "  npm_config_registry=$npm_config_registry"
+    fi
 
     # === Run bitbake ===
     echo ""
@@ -1089,6 +2516,152 @@ calc_parallelism() {
     echo "$budget"
 }
 
+# Probe both npm registries in parallel, return the URL of the faster one.
+# Default preference: npmmirror.com (Chinese mirror).
+# If npmjs.org is clearly faster (<3s AND <1.5× mirror time), prefer npmjs.org.
+# Returns: echoes registry URL, or empty string if both fail.
+probe_npm_registry() {
+    local npmjs_url="https://registry.npmjs.org/uuid/-/uuid-9.0.0.tgz"
+    local mirror_url="https://registry.npmmirror.com/uuid/-/uuid-9.0.0.tgz"
+    local tmp_npmjs tmp_mirror
+
+    if ! command -v curl &>/dev/null; then
+        verbose "curl not available, defaulting to npmmirror.com"
+        echo "https://registry.npmmirror.com/"
+        return 0
+    fi
+
+    tmp_npmjs=$(mktemp /tmp/ob-npm-probe-npmjs-XXXXXX)
+    tmp_mirror=$(mktemp /tmp/ob-npm-probe-mirror-XXXXXX)
+
+    # Parallel probes — each writes download time (seconds) to a temp file
+    { curl -s -o /dev/null -w '%{time_total}' --max-time 10 "$npmjs_url" > "$tmp_npmjs" 2>/dev/null; } &
+    local pid_npmjs=$!
+    { curl -s -o /dev/null -w '%{time_total}' --max-time 10 "$mirror_url" > "$tmp_mirror" 2>/dev/null; } &
+    local pid_mirror=$!
+
+    wait "$pid_npmjs" 2>/dev/null || true
+    wait "$pid_mirror" 2>/dev/null || true
+
+    local npmjs_time="" mirror_time=""
+    npmjs_time=$(cat "$tmp_npmjs" 2>/dev/null | tr -d '[:space:]')
+    mirror_time=$(cat "$tmp_mirror" 2>/dev/null | tr -d '[:space:]')
+    rm -f "$tmp_npmjs" "$tmp_mirror"
+
+    verbose "  npmjs.org: ${npmjs_time:-timeout}s | npmmirror.com: ${mirror_time:-timeout}s"
+
+    # Both failed
+    if [[ -z "$npmjs_time" ]] && [[ -z "$mirror_time" ]]; then
+        echo ""
+        return 0
+    fi
+
+    # Only one succeeded — use it
+    if [[ -z "$npmjs_time" ]]; then
+        echo "https://registry.npmmirror.com/"
+        return 0
+    fi
+    if [[ -z "$mirror_time" ]]; then
+        echo "https://registry.npmjs.org/"
+        return 0
+    fi
+
+    # Both succeeded — pick the better one.
+    # npmmirror.com is the safe default. Only switch to npmjs.org when
+    # the mirror is genuinely slow and npmjs.org is clearly fast.
+    local mirror_fast=0
+    if awk "BEGIN { exit !($mirror_time < 2) }" 2>/dev/null; then
+        mirror_fast=1
+    fi
+
+    if [[ "$mirror_fast" -eq 1 ]]; then
+        echo "https://registry.npmmirror.com/"
+    elif awk "BEGIN { exit !($npmjs_time < 1) }" 2>/dev/null; then
+        echo "https://registry.npmjs.org/"
+    else
+        echo "https://registry.npmmirror.com/"
+    fi
+}
+
+# Resolve which npm registry to use.
+# Decision order: OB_NPM_REGISTRY env > cache (<24h) > probe > error.
+# Sets NPM_REGISTRY_RESOLVED: the chosen URL, "" for npm default, or "skip".
+resolve_npm_registry() {
+    local cache_file="$CONFIGS_DIR/$MACHINE.npm-registry"
+    local cache_ttl=86400  # 24 hours
+    NPM_REGISTRY_RESOLVED=""
+
+    # 1. Environment variable override
+    if [[ -n "${OB_NPM_REGISTRY+x}" ]]; then
+        if [[ -z "$OB_NPM_REGISTRY" ]]; then
+            info "OB_NPM_REGISTRY is set (empty) — npm registry auto-detection disabled"
+            NPM_REGISTRY_RESOLVED="skip"
+            return 0
+        fi
+        info "OB_NPM_REGISTRY override: $OB_NPM_REGISTRY"
+        NPM_REGISTRY_RESOLVED="$OB_NPM_REGISTRY"
+        return 0
+    fi
+
+    # 2. Cache check
+    if [[ -f "$cache_file" ]]; then
+        local cache_epoch cache_url cache_age
+        cache_epoch=$(sed -n '1p' "$cache_file" 2>/dev/null | grep -oP '^\d+$' || echo "")
+        cache_url=$(sed -n '2p' "$cache_file" 2>/dev/null || true)
+        if [[ -n "$cache_epoch" && -n "$cache_url" ]]; then
+            cache_age=$(( $(date +%s) - cache_epoch ))
+            if [[ "$cache_age" -lt "$cache_ttl" ]]; then
+                local hours_ago=$(( cache_age / 3600 ))
+                info "npm registry: $cache_url (cached, probed ${hours_ago}h ago)"
+                NPM_REGISTRY_RESOLVED="$cache_url"
+                return 0
+            fi
+            verbose "npm registry cache stale (${cache_age}s > ${cache_ttl}s), re-probing"
+        fi
+    fi
+
+    # 3. Live probe
+    info "Probing npm registries (npmjs.org vs npmmirror.com, max 10s)..."
+    local chosen_url
+    chosen_url=$(probe_npm_registry)
+    if [[ -z "$chosen_url" ]]; then
+        # Both registries timed out — check if this was a real timeout or curl missing
+        if ! command -v curl &>/dev/null; then
+            warn "curl not available for npm registry probe, using npmjs.org default"
+            chosen_url="https://registry.npmjs.org/"
+        else
+            echo ""
+            error "Both npm registries are unreachable (10s timeout):"
+            error "  - registry.npmjs.org: timeout"
+            error "  - registry.npmmirror.com: timeout"
+            echo ""
+            echo "  Possible causes:"
+            echo "    1. No internet connectivity"
+            echo "    2. Firewall blocking HTTPS to registry hosts"
+            echo "    3. DNS resolution failure"
+            echo ""
+            echo "  To override manually:"
+            echo "    export OB_NPM_REGISTRY=https://registry.npmmirror.com/"
+            echo "    ob build"
+            echo ""
+            echo "  To skip npm configuration entirely:"
+            echo "    export OB_NPM_REGISTRY="
+            echo "    ob build"
+            echo ""
+            exit 1
+        fi
+    fi
+
+    # Write cache
+    {
+        date +%s
+        echo "$chosen_url"
+    } > "$cache_file" 2>/dev/null || warn "Failed to write npm registry cache to $cache_file"
+
+    info "npm registry: $chosen_url (auto-detected)"
+    NPM_REGISTRY_RESOLVED="$chosen_url"
+}
+
 # Capture `source setup` (no args) output, extract available machine names
 list_available_machines() {
     [[ -d "$OPENBMC_DIR/.git" ]] || return 0
@@ -1130,6 +2703,47 @@ require_openbmc_repo() {
     clone_openbmc
 }
 
+# Print "Previously initialized" separator showing init-done machines
+# with their original index from the full machine list.
+# Args:
+#   $1: machine name array (nameref)
+#   $2: CONFIGS_DIR path
+print_previously_initialized() {
+    local -n _mpi_arr="$1"
+    local _mpi_configs_dir="$2"
+
+    # Discover init-done machines
+    local -A _mpi_done=()
+    local _mpi_f _mpi_mname _mpi_raw_time _mpi_fmt_time
+    for _mpi_f in "$_mpi_configs_dir"/*.init-done; do
+        [[ -f "$_mpi_f" ]] || continue
+        _mpi_mname=$(basename "$_mpi_f" .init-done)
+        _mpi_raw_time=$(head -1 "$_mpi_f" 2>/dev/null || true)
+        _mpi_fmt_time=$(format_timestamp "$_mpi_raw_time")
+        _mpi_done["$_mpi_mname"]="$_mpi_fmt_time"
+    done
+
+    # No init-done machines → nothing to show
+    if [[ ${#_mpi_done[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    # Print separator
+    echo ""
+    echo -e "  ${YELLOW}─── Previously initialized ───${NC}"
+
+    # Match init-done machines to their index in the full list
+    local _mpi_i=0
+    local _mpi_total=${#_mpi_arr[@]}
+    local _mpi_idx_width=${#_mpi_total}
+    for _mpi_m in "${_mpi_arr[@]}"; do
+        _mpi_i=$((_mpi_i + 1))
+        if [[ -n "${_mpi_done[$_mpi_m]:-}" ]]; then
+            printf "  %${_mpi_idx_width}d) %-20s %s\n" "$_mpi_i" "$_mpi_m" "${_mpi_done[$_mpi_m]}"
+        fi
+    done
+}
+
 resolve_machine() {
     local machines
     machines=$(list_available_machines)
@@ -1143,6 +2757,7 @@ resolve_machine() {
     # Fast path: machine specified and valid
     if [[ -n "$MACHINE" ]] && echo "$machines" | grep -qx -- "$MACHINE"; then
         print_available_machines
+        print_previously_initialized machine_arr "$CONFIGS_DIR"
         info "Machine '$MACHINE' confirmed."
         return 0
     fi
@@ -1171,6 +2786,8 @@ resolve_machine() {
             printf "  %${idx_width}d) %s\n" "$i" "$m"
         done
     } | column -c "$term_cols" 2>/dev/null
+
+    print_previously_initialized machine_arr "$CONFIGS_DIR"
 
     local selected
     local chosen=""
@@ -1368,8 +2985,9 @@ init_bitbake_env() {
 
     # Pre-create DL_DIR and SSTATE_DIR so bitbake sanity checks don't fail
     # when the .inc file (generated later in Step 7) references them.
+    # Use resolve functions to respect overrides in local.conf (e.g. DL_DIR="/shared/downloads").
     if [[ -f "$BUILD_DIR/conf/externalsrc-$MACHINE.inc" ]]; then
-        mkdir -p "$WORKSPACE_DIR/downloads" "$WORKSPACE_DIR/sstate-cache"
+        mkdir -p "$(resolve_effective_dl_dir)" "$(resolve_effective_sstate_dir)"
 
         # Fix legacy .inc files that use ${TOPDIR}/../../../.. relative paths.
         # Bitbake internally prepends '\/' to these resolved paths, causing mkdir
@@ -1708,6 +3326,20 @@ generate_build_config() {
         echo "DL_DIR ??= \"$WORKSPACE_DIR/downloads\""
         echo "SSTATE_DIR ??= \"$WORKSPACE_DIR/sstate-cache\""
 
+        echo ""
+        echo "# npm network timeout defaults for Node.js recipes (e.g. webui-vue)."
+        echo "# Override in local.conf with = if needed. Registry is auto-detected by 'ob build'."
+        echo "npm_config_fetch_timeout ??= \"600000\""
+        echo "export npm_config_fetch_timeout"
+        echo "npm_config_fetch_retry_maxtimeout ??= \"120000\""
+        echo "export npm_config_fetch_retry_maxtimeout"
+        echo "npm_config_fetch_retry_mintimeout ??= \"30000\""
+        echo "export npm_config_fetch_retry_mintimeout"
+        echo "npm_config_fetch_retry_factor ??= \"2\""
+        echo "export npm_config_fetch_retry_factor"
+        echo "# npm_config_registry is NOT set here — it is injected dynamically by 'ob build'"
+        echo "# via BB_ENV_PASSTHROUGH_ADDITIONS. Setting it to empty would break direct bitbake."
+
         if [[ "$is_wsl" -eq 1 ]] && [[ -n "$parallel_n" ]]; then
             echo ""
             echo "# WSL parallelism auto-tuning (WSL swap is slower than bare-metal, prone to OOM)."
@@ -1720,7 +3352,7 @@ generate_build_config() {
         fi
     } > "$inc_file"
 
-    mkdir -p "$WORKSPACE_DIR/downloads" "$WORKSPACE_DIR/sstate-cache"
+    mkdir -p "$(resolve_effective_dl_dir)" "$(resolve_effective_sstate_dir)"
 
     info "Generated $inc_file"
 }
@@ -1779,6 +3411,480 @@ print_report() {
     echo ""
     info "Re-running ob init is safe — it is incremental and idempotent."
     echo "Safe to Ctrl+C at any time; re-run will resume from where it left off."
+}
+
+# ──────────────────────────────────────────────
+# ob start-qemu
+# ──────────────────────────────────────────────
+
+cmd_start_qemu() {
+    detect_harness_root
+
+    # ── Resolve machine ──
+    if [[ -z "$MACHINE" ]]; then
+        # Discover init-done machines (reuse cmd_build pattern)
+        local -a machines=()
+        for init_done_file in "$CONFIGS_DIR"/*.init-done; do
+            [[ -f "$init_done_file" ]] || continue
+            machines+=("$(basename "$init_done_file" .init-done)")
+        done
+
+        if [[ ${#machines[@]} -eq 0 ]]; then
+            error "No machines initialized."
+            error "Run 'ob init <machine>' first."
+            exit 3
+        fi
+
+        if [[ ! -t 0 ]]; then
+            error "No interactive terminal. Specify machine: ob start-qemu <machine>"
+            exit 3
+        fi
+
+        echo ""
+        step_header "Select Machine"
+        local total=${#machines[@]}
+        local idx_width=${#total}
+        local i
+        for (( i=0; i<total; i++ )); do
+            printf "  %${idx_width}d) %s\n" "$((i + 1))" "${machines[$i]}"
+        done
+        echo ""
+
+        local selected
+        while true; do
+            if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Select a machine [1-${total}]: ")" selected; then
+                error "Unable to read selection from stdin."
+                exit 1
+            fi
+            if [[ "$selected" =~ ^[0-9]+$ ]] && [[ "$selected" -ge 1 && "$selected" -le "$total" ]]; then
+                MACHINE="${machines[$((selected - 1))]}"
+                break
+            fi
+            warn "Please enter a number (1-${total})"
+        done
+    fi
+
+    # Re-derive paths after machine resolution
+    BUILD_DIR="$OPENBMC_DIR/build/$MACHINE"
+    SOURCE_LOCK_FILE="$CONFIGS_DIR/openbmc-source.lock"
+
+    # ── Prerequisite 1: machine init-done ──
+    if [[ ! -f "$CONFIGS_DIR/$MACHINE.init-done" ]]; then
+        error "Machine '$MACHINE' has not been initialized."
+        error "Run 'ob init $MACHINE' first."
+        exit 3
+    fi
+
+    resolve_qb_vars
+
+    # ── SoC detection (backfills QB_SYSTEM_NAME if bitbake didn't provide it) ──
+    detect_soc_type
+
+    # ── QEMU machine name derivation (QB_MACHINE → fallback to xxx-bmc) ──
+    derive_qemu_machine_name
+
+    # ── Prerequisite 4: QEMU binary ──
+    ensure_qemu_binary
+
+    # ── Prerequisite 4b: QEMU firmware (bootroms, etc.) ──
+    ensure_qemu_firmware
+
+    # ── Prerequisite 5: image file ──
+    local image_file=""
+    # Locate .static.mtd in deploy directory
+    local deploy_dir="$BUILD_DIR/tmp/deploy/images/$MACHINE"
+    if [[ ! -d "$deploy_dir" ]]; then
+        error "Image deploy directory not found: $deploy_dir"
+        error "Run 'ob build' for machine '$MACHINE' first."
+        exit 3
+    fi
+
+    # Look for the static MTD image
+    image_file=$(find "$deploy_dir" -maxdepth 1 -name "*.static.mtd" -type f 2>/dev/null | head -1 || true)
+    if [[ -z "$image_file" ]]; then
+        error "No .static.mtd image found in $deploy_dir"
+        error "Run 'ob build' for machine '$MACHINE' first."
+        exit 3
+    fi
+    verbose "Image file: $image_file"
+
+    # ── Check for existing QEMU instance (before port resolution) ──
+    #     Same-machine check must come first — port conflicts are usually
+    #     caused by *this* instance; asking user to reassign ports is misleading.
+    derive_qemu_paths
+    if read_pid_file; then
+        local pid_status
+        validate_pid "$PIDFILE_PID" "$PIDFILE_BINARY" "$MACHINE"
+        pid_status=$?
+
+        if [[ $pid_status -eq 0 ]]; then
+            # Instance is running and valid
+            if [[ "$QEMU_FORCE" -eq 1 ]]; then
+                warn "Killing existing QEMU instance (PID $PIDFILE_PID)..."
+                kill "$PIDFILE_PID" 2>/dev/null || true
+                sleep 2
+                rm -f "$QEMU_PID_FILE"
+            elif [[ -t 0 ]]; then
+                echo ""
+                warn "QEMU instance already running for '$MACHINE':"
+                echo "  PID       : $PIDFILE_PID"
+                echo "  Started   : $PIDFILE_STARTED_AT"
+                echo "  Ports     : SSH($PIDFILE_SSH_PORT) Redfish($PIDFILE_REDFISH_PORT) IPMI($PIDFILE_IPMI_PORT/UDP)"
+                echo "  Serial log: $PIDFILE_SERIAL_LOG"
+                echo ""
+                local answer
+                if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Kill and restart? [y/N]: ")" answer; then
+                    exit 1
+                fi
+                if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+                    info "Aborted."
+                    exit 0
+                fi
+                kill "$PIDFILE_PID" 2>/dev/null || true
+                sleep 2
+                rm -f "$QEMU_PID_FILE"
+            else
+                error "QEMU instance already running for '$MACHINE' (PID $PIDFILE_PID)."
+                error "Use --force to kill and restart, or 'ob stop-qemu $MACHINE' first."
+                exit 1
+            fi
+        else
+            # Stale PID file — clean up
+            rm -f "$QEMU_PID_FILE"
+        fi
+    fi
+
+    # ── Resolve ports: CLI > env var > default ──
+    local ssh_port redfish_port ipmi_port http_port serial_log
+
+    ssh_port="${QEMU_SSH_PORT:-${OB_QEMU_SSH_PORT:-2222}}"
+    redfish_port="${QEMU_REDFISH_PORT:-${OB_QEMU_REDFISH_PORT:-2443}}"
+    ipmi_port="${QEMU_IPMI_PORT:-${OB_QEMU_IPMI_PORT:-2623}}"
+    http_port="${QEMU_HTTP_PORT:-${OB_QEMU_HTTP_PORT:-}}"
+    serial_log="${QEMU_SERIAL_LOG:-${OB_QEMU_SERIAL_LOG:-${HOME%/}/tmp/qemu-${MACHINE}-serial.log}}"
+
+    # ── Interactive port conflict resolution for additional QEMU instances ──
+    resolve_qemu_ports_interactive ssh_port redfish_port ipmi_port http_port
+
+    # ── Prerequisite 6: port availability ──
+    local -a ports_to_check=("tcp" "$ssh_port" "tcp" "$redfish_port" "udp" "$ipmi_port")
+    if [[ -n "$http_port" ]]; then
+        ports_to_check+=("tcp" "$http_port")
+    fi
+    check_ports_available "${ports_to_check[@]}"
+
+    # ── Build QEMU command (SoC-specific template) ──
+    build_qemu_cmd "$image_file" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
+
+    step_header "Starting QEMU for '$MACHINE' ($SOC_TYPE)"
+    echo "  Machine   : $QB_MACHINE_NAME"
+    echo "  SoC       : $SOC_TYPE"
+    echo "  Binary    : $QEMU_BIN_FILE"
+    echo "  Image     : $image_file"
+    echo "  Serial log: $serial_log"
+    echo ""
+
+    # ── Safety confirmation (same pattern as ob init / ob build) ──
+    echo "============================================================"
+    echo ""
+    warn "  You are about to start QEMU for:  >>> $MACHINE <<<"
+    warn "  You are about to start QEMU for:  >>> $MACHINE <<<"
+    warn "  You are about to start QEMU for:  >>> $MACHINE <<<"
+    echo ""
+    echo "============================================================"
+    echo ""
+    while true; do
+        local confirm
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Type (Y/y) to confirm and start QEMU, (N/n) to cancel: ")" confirm; then
+            error "Unable to read confirmation from stdin."
+            exit 1
+        fi
+        case "$confirm" in
+            [yY])
+                echo ""
+                info "QEMU start confirmed for machine '$MACHINE'."
+                break
+                ;;
+            [nN])
+                warn "QEMU start cancelled by user."
+                exit 0
+                ;;
+            *)
+                warn "Invalid input. Please type Y or N."
+                ;;
+        esac
+    done
+
+    # ── Emergency escape window ──
+    warn "Launching QEMU in 3 seconds..."
+    echo ""
+    for _i in 3 2 1; do
+        echo -e "  ${_i}..."
+        sleep 1
+    done
+
+    verbose "Command: setsid ${QEMU_CMD[*]}"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[DRY-RUN] Would run: setsid ${QEMU_CMD[*]}"
+        exit 0
+    fi
+
+    local qemu_stderr
+    qemu_stderr=$(mktemp "${TMPDIR:-/tmp}/qemu-stderr-XXXXXX")
+    if ! setsid "${QEMU_CMD[@]}" >"$qemu_stderr" 2>&1; then
+        error "QEMU failed to start."
+        local qemu_err_msg
+        qemu_err_msg=$(grep -v "^qemu-system.*: warning:" "$qemu_stderr" 2>/dev/null || true)
+        if [[ -n "$qemu_err_msg" ]]; then
+            error "$(echo "$qemu_err_msg" | head -5)"
+        fi
+        error "Check serial log: $serial_log"
+        error "Verify QEMU binary: $QEMU_BIN_FILE"
+        rm -f "$qemu_stderr"
+        exit 1
+    fi
+    rm -f "$qemu_stderr"
+
+    _qemu_post_launch "$QB_MACHINE_NAME" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
+}
+
+# ──────────────────────────────────────────────
+# Post-launch: write PID, wait, print summary
+# ──────────────────────────────────────────────
+
+_qemu_post_launch() {
+    local qb_machine_name="$1"
+    local ssh_port="$2"
+    local redfish_port="$3"
+    local ipmi_port="$4"
+    local http_port="$5"
+    local serial_log="$6"
+
+    # ── Write PID file ──
+    sleep 1
+    local qemu_pid=""
+    qemu_pid=$(pgrep -f "qemu-system.*-machine.*$qb_machine_name" 2>/dev/null | head -1 || true)
+    if [[ -z "$qemu_pid" ]]; then
+        qemu_pid=$(pgrep -f "$QEMU_BIN_FILE.*$MACHINE" 2>/dev/null | head -1 || true)
+    fi
+
+    mkdir -p "$QEMU_PIDS_DIR"
+    cat > "$QEMU_PID_FILE" <<PIDFILE_EOF
+pid=$qemu_pid
+user=$(whoami)
+machine=$MACHINE
+binary=$QEMU_BIN_FILE
+qemu_machine=$qb_machine_name
+started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ssh_port=$ssh_port
+redfish_port=$redfish_port
+ipmi_port=$ipmi_port
+http_port=${http_port:-none}
+serial_log=$serial_log
+PIDFILE_EOF
+
+    verbose "PID file written: $QEMU_PID_FILE (PID: $qemu_pid)"
+
+    # ── Wait for BMC ready (unless --no-wait) ──
+    if [[ "$QEMU_NO_WAIT" -eq 0 ]]; then
+        echo ""
+        info "Waiting for BMC to become ready (SSH on port $ssh_port)..."
+        local attempts=0
+        local max_attempts=30
+        local ready=0
+
+        while [[ $attempts -lt $max_attempts ]]; do
+            attempts=$((attempts + 1))
+            if sshpass -p 0penBmc ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+                 -o UserKnownHostsFile=/dev/null -p "$ssh_port" root@localhost echo "OK" >/dev/null 2>&1; then
+                ready=1
+                break
+            fi
+            printf "\r  Waiting... attempt %d/%d" "$attempts" "$max_attempts"
+            sleep 5
+        done
+        echo ""
+
+        if [[ $ready -eq 0 ]]; then
+            warn "BMC did not become SSH-ready within $((max_attempts * 5)) seconds."
+            warn "It may still be booting. Check serial log: $serial_log"
+        else
+            info "BMC ready after attempt $attempts (~$((attempts * 5))s)"
+        fi
+    fi
+
+    # ── Print connection summary ──
+    echo ""
+    echo -e "${GREEN}✅ QEMU started for '$MACHINE'${NC} (PID $qemu_pid)"
+    echo ""
+    echo "Connect:"
+    echo "  SSH     : ssh root@localhost -p $ssh_port  (password: 0penBmc)"
+    echo "  WebUI   : https://localhost:$redfish_port  (root / 0penBmc)"
+    echo "  Redfish : curl -sk -u root:0penBmc https://localhost:$redfish_port/redfish/v1"
+    echo "  IPMI    : ipmitool -I lanplus -H localhost -p $ipmi_port -U root -P 0penBmc mc info"
+    echo ""
+    echo "Logs:"
+    echo "  Serial  : $serial_log"
+    echo "  PID file: $QEMU_PID_FILE"
+    echo ""
+    echo "Stop:"
+    echo "  ob stop-qemu $MACHINE"
+    echo ""
+}
+
+# ──────────────────────────────────────────────
+# ob stop-qemu
+# ──────────────────────────────────────────────
+
+cmd_stop_qemu() {
+    detect_harness_root
+
+    # ── Collect target machines ──
+    local -a targets=()
+
+    if [[ "$QEMU_STOP_ALL" -eq 1 ]]; then
+        # --all: stop every instance
+        for pid_file in "$WORKSPACE_DIR/qemu-bin/.pids/"*.pid; do
+            [[ -f "$pid_file" ]] || continue
+            targets+=("$(basename "$pid_file" .pid)")
+        done
+    elif [[ -n "$MACHINE" ]]; then
+        targets+=("$MACHINE")
+    else
+        # No machine specified: list all and let user choose
+        local -a available=()
+        for pid_file in "$WORKSPACE_DIR/qemu-bin/.pids/"*.pid; do
+            [[ -f "$pid_file" ]] || continue
+            available+=("$(basename "$pid_file" .pid)")
+        done
+
+        if [[ ${#available[@]} -eq 0 ]]; then
+            info "No QEMU instances found."
+            return 0
+        fi
+
+        if [[ ! -t 0 ]]; then
+            error "No interactive terminal. Specify machine: ob stop-qemu <machine>"
+            error "Or use --all: ob stop-qemu --all"
+            exit 3
+        fi
+
+        echo ""
+        step_header "Running QEMU Instances"
+        local total=${#available[@]}
+        local idx_width=${#total}
+        local i
+        for (( i=0; i<total; i++ )); do
+            local m="${available[$i]}"
+            MACHINE="$m"
+            QEMU_PID_FILE="$WORKSPACE_DIR/qemu-bin/.pids/$m.pid"
+            local status_str=""
+            if read_pid_file && validate_pid "$PIDFILE_PID" "$PIDFILE_BINARY" "$PIDFILE_MACHINE"; then
+                status_str="✅ running (PID $PIDFILE_PID)"
+            else
+                status_str="⚠️  stale"
+            fi
+            printf "  %${idx_width}d) %-20s %s\n" "$((i + 1))" "$m" "$status_str"
+        done
+        echo ""
+
+        local selected
+        while true; do
+            if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Select instance to stop [1-${total}]: ")" selected; then
+                exit 1
+            fi
+            if [[ "$selected" =~ ^[0-9]+$ ]] && [[ "$selected" -ge 1 && "$selected" -le "$total" ]]; then
+                targets+=("${available[$((selected - 1))]}")
+                break
+            fi
+            warn "Please enter a number (1-${total})"
+        done
+    fi
+
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        info "No QEMU instances to stop."
+        return 0
+    fi
+
+    # ── Stop each target ──
+    for target_machine in "${targets[@]}"; do
+        MACHINE="$target_machine"
+        QEMU_PID_FILE="$WORKSPACE_DIR/qemu-bin/.pids/$MACHINE.pid"
+
+        echo ""
+        if ! read_pid_file; then
+            info "No PID file for '$MACHINE' — not running."
+            continue
+        fi
+
+        local pid_status
+        validate_pid "$PIDFILE_PID" "$PIDFILE_BINARY" "$PIDFILE_MACHINE"
+        pid_status=$?
+
+        if [[ $pid_status -eq 1 ]]; then
+            info "QEMU process for '$MACHINE' (PID $PIDFILE_PID) has already exited."
+            rm -f "$QEMU_PID_FILE"
+            continue
+        fi
+
+        if [[ $pid_status -eq 2 ]]; then
+            warn "PID $PIDFILE_PID no longer belongs to QEMU (recycled). Cleaning stale PID file."
+            rm -f "$QEMU_PID_FILE"
+            continue
+        fi
+
+        # Process is running — show info and confirm
+        echo -e "Running QEMU instance for '${BOLD}$MACHINE${NC}':"
+        echo "  PID       : $PIDFILE_PID"
+        echo "  Started   : $PIDFILE_STARTED_AT"
+        echo "  Ports     : SSH($PIDFILE_SSH_PORT) Redfish($PIDFILE_REDFISH_PORT) IPMI($PIDFILE_IPMI_PORT/UDP)"
+        echo "  Serial log: $PIDFILE_SERIAL_LOG"
+        echo ""
+
+        if [[ "$QEMU_FORCE" -ne 1 ]]; then
+            if [[ -t 0 ]]; then
+                while true; do
+                    local answer
+                    if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Stop this instance? [y/N]: ")" answer; then
+                        exit 1
+                    fi
+                    case "$answer" in
+                        [yY])
+                            break
+                            ;;
+                        [nN])
+                            info "Skipped '$MACHINE'."
+                            continue 2
+                            ;;
+                        *)
+                            warn "Invalid input. Please type Y or N."
+                            ;;
+                    esac
+                done
+            else
+                error "Non-interactive mode. Use --force to stop without confirmation."
+                exit 1
+            fi
+        fi
+
+        # Kill and wait
+        kill "$PIDFILE_PID" 2>/dev/null || true
+        local wait_count=0
+        while [[ -d "/proc/$PIDFILE_PID" ]] && [[ $wait_count -lt 10 ]]; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
+
+        if [[ -d "/proc/$PIDFILE_PID" ]]; then
+            warn "Process $PIDFILE_PID did not exit gracefully, sending SIGKILL..."
+            kill -9 "$PIDFILE_PID" 2>/dev/null || true
+            sleep 1
+        fi
+
+        rm -f "$QEMU_PID_FILE"
+        info "QEMU instance for '$MACHINE' stopped."
+    done
 }
 
 # === Main ===
@@ -1880,10 +3986,7 @@ cmd_init() {
 
     # Write init-done marker (all 8 steps completed successfully).
     # ob build uses this to discover buildable machines.
-    {
-        date -u +"%Y-%m-%dT%H:%M:%SZ"
-        echo "source_label=${SOURCE_LABEL}"
-    } > "$CONFIGS_DIR/$MACHINE.init-done"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$CONFIGS_DIR/$MACHINE.init-done"
 }
 
 cmd_menu() {
@@ -1906,17 +4009,19 @@ cmd_menu() {
         fi
 
         echo "Please select a task:"
-        echo "    1 - init   - Initialize OpenBMC development environment"
-        echo "    2 - build  - Build OpenBMC firmware image"
-        echo "    3 - status - Show current OpenBMC workspace status"
+        echo "    1 - init        - Initialize OpenBMC development environment"
+        echo "    2 - build       - Build OpenBMC firmware image"
+        echo "    3 - status      - Show current OpenBMC workspace status"
+        echo "    4 - start-qemu  - Launch QEMU with built BMC image"
+        echo "    5 - stop-qemu   - Stop a running QEMU instance"
         echo "    C - Clear terminal screen  (c/C)"
         echo "    Q - Quit this 'ob' session (q/Q)"
         echo ""
-        echo "Tip: CLI mode — ./ob init <machine> | ./ob build | ./ob --help"
+        echo "Tip: CLI mode — ./ob init <machine> | ./ob build | ./ob start-qemu <machine> | ./ob --help"
         echo ""
 
         local choice
-        read -r -p "$(echo -e "${PROMPT_PREFIX} Choose [1/2/3/C/Q]: ")" choice
+        read -r -p "$(echo -e "${PROMPT_PREFIX} Choose [1/2/3/4/5/C/Q]: ")" choice
 
         case "$choice" in
             1)
@@ -1952,6 +4057,24 @@ cmd_menu() {
                 fi
                 read -r -p "$(echo -e "${PROMPT_PREFIX} Press Enter to continue...") " _dummy
                 ;;
+            4)
+                local qemu_rc=0
+                (cmd_start_qemu) || qemu_rc=$?
+                echo ""
+                if [[ "$qemu_rc" -ne 0 && "$qemu_rc" -ne 3 ]]; then
+                    error "start-qemu failed (exit code: $qemu_rc)."
+                fi
+                read -r -p "$(echo -e "${PROMPT_PREFIX} Press Enter to continue...") " _dummy
+                ;;
+            5)
+                local stop_rc=0
+                (cmd_stop_qemu) || stop_rc=$?
+                echo ""
+                if [[ "$stop_rc" -ne 0 && "$stop_rc" -ne 3 ]]; then
+                    error "stop-qemu failed (exit code: $stop_rc)."
+                fi
+                read -r -p "$(echo -e "${PROMPT_PREFIX} Press Enter to continue...") " _dummy
+                ;;
             [cC])
                 clear
                 show_logo
@@ -1962,7 +4085,7 @@ cmd_menu() {
                 fn_quit
                 ;;
             *)
-                echo -e "${YELLOW}ob-harness> Invalid input. Please choose 1/2/3/C/Q${NC}"
+                echo -e "${YELLOW}ob-harness> Invalid input. Please choose 1/2/3/4/5/C/Q${NC}"
                 continue
                 ;;
         esac
@@ -1992,6 +4115,16 @@ main() {
     if [[ "$COMMAND" == "build" ]]; then
         cmd_build
         return 0
+    fi
+
+    if [[ "$COMMAND" == "start-qemu" ]]; then
+        cmd_start_qemu
+        return $?
+    fi
+
+    if [[ "$COMMAND" == "stop-qemu" ]]; then
+        cmd_stop_qemu
+        return $?
     fi
 
     cmd_init
