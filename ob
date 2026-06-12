@@ -3508,26 +3508,9 @@ cmd_start_qemu() {
     fi
     verbose "Image file: $image_file"
 
-    # ── Resolve ports: CLI > env var > default ──
-    local ssh_port redfish_port ipmi_port http_port serial_log
-
-    ssh_port="${QEMU_SSH_PORT:-${OB_QEMU_SSH_PORT:-2222}}"
-    redfish_port="${QEMU_REDFISH_PORT:-${OB_QEMU_REDFISH_PORT:-2443}}"
-    ipmi_port="${QEMU_IPMI_PORT:-${OB_QEMU_IPMI_PORT:-2623}}"
-    http_port="${QEMU_HTTP_PORT:-${OB_QEMU_HTTP_PORT:-}}"
-    serial_log="${QEMU_SERIAL_LOG:-${OB_QEMU_SERIAL_LOG:-${HOME%/}/tmp/qemu-${MACHINE}-serial.log}}"
-
-    # ── Interactive port conflict resolution for additional QEMU instances ──
-    resolve_qemu_ports_interactive ssh_port redfish_port ipmi_port http_port
-
-    # ── Prerequisite 6: port availability ──
-    local -a ports_to_check=("tcp" "$ssh_port" "tcp" "$redfish_port" "udp" "$ipmi_port")
-    if [[ -n "$http_port" ]]; then
-        ports_to_check+=("tcp" "$http_port")
-    fi
-    check_ports_available "${ports_to_check[@]}"
-
-    # ── Check for existing QEMU instance ──
+    # ── Check for existing QEMU instance (before port resolution) ──
+    #     Same-machine check must come first — port conflicts are usually
+    #     caused by *this* instance; asking user to reassign ports is misleading.
     derive_qemu_paths
     if read_pid_file; then
         local pid_status
@@ -3571,6 +3554,25 @@ cmd_start_qemu() {
         fi
     fi
 
+    # ── Resolve ports: CLI > env var > default ──
+    local ssh_port redfish_port ipmi_port http_port serial_log
+
+    ssh_port="${QEMU_SSH_PORT:-${OB_QEMU_SSH_PORT:-2222}}"
+    redfish_port="${QEMU_REDFISH_PORT:-${OB_QEMU_REDFISH_PORT:-2443}}"
+    ipmi_port="${QEMU_IPMI_PORT:-${OB_QEMU_IPMI_PORT:-2623}}"
+    http_port="${QEMU_HTTP_PORT:-${OB_QEMU_HTTP_PORT:-}}"
+    serial_log="${QEMU_SERIAL_LOG:-${OB_QEMU_SERIAL_LOG:-${HOME%/}/tmp/qemu-${MACHINE}-serial.log}}"
+
+    # ── Interactive port conflict resolution for additional QEMU instances ──
+    resolve_qemu_ports_interactive ssh_port redfish_port ipmi_port http_port
+
+    # ── Prerequisite 6: port availability ──
+    local -a ports_to_check=("tcp" "$ssh_port" "tcp" "$redfish_port" "udp" "$ipmi_port")
+    if [[ -n "$http_port" ]]; then
+        ports_to_check+=("tcp" "$http_port")
+    fi
+    check_ports_available "${ports_to_check[@]}"
+
     # ── Build QEMU command (SoC-specific template) ──
     build_qemu_cmd "$image_file" "$ssh_port" "$redfish_port" "$ipmi_port" "$http_port" "$serial_log"
 
@@ -3581,6 +3583,45 @@ cmd_start_qemu() {
     echo "  Image     : $image_file"
     echo "  Serial log: $serial_log"
     echo ""
+
+    # ── Safety confirmation (same pattern as ob init / ob build) ──
+    echo "============================================================"
+    echo ""
+    warn "  You are about to start QEMU for:  >>> $MACHINE <<<"
+    warn "  You are about to start QEMU for:  >>> $MACHINE <<<"
+    warn "  You are about to start QEMU for:  >>> $MACHINE <<<"
+    echo ""
+    echo "============================================================"
+    echo ""
+    while true; do
+        local confirm
+        if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Type (Y/y) to confirm and start QEMU, (N/n) to cancel: ")" confirm; then
+            error "Unable to read confirmation from stdin."
+            exit 1
+        fi
+        case "$confirm" in
+            [yY])
+                echo ""
+                info "QEMU start confirmed for machine '$MACHINE'."
+                break
+                ;;
+            [nN])
+                warn "QEMU start cancelled by user."
+                exit 0
+                ;;
+            *)
+                warn "Invalid input. Please type Y or N."
+                ;;
+        esac
+    done
+
+    # ── Emergency escape window ──
+    warn "Launching QEMU in 3 seconds..."
+    echo ""
+    for _i in 3 2 1; do
+        echo -e "  ${_i}..."
+        sleep 1
+    done
 
     verbose "Command: setsid ${QEMU_CMD[*]}"
 
@@ -3803,14 +3844,24 @@ cmd_stop_qemu() {
 
         if [[ "$QEMU_FORCE" -ne 1 ]]; then
             if [[ -t 0 ]]; then
-                local answer
-                if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Stop this instance? [y/N]: ")" answer; then
-                    exit 1
-                fi
-                if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
-                    info "Skipped '$MACHINE'."
-                    continue
-                fi
+                while true; do
+                    local answer
+                    if ! read -r -p "$(echo -e "${PROMPT_PREFIX} Stop this instance? [y/N]: ")" answer; then
+                        exit 1
+                    fi
+                    case "$answer" in
+                        [yY])
+                            break
+                            ;;
+                        [nN])
+                            info "Skipped '$MACHINE'."
+                            continue 2
+                            ;;
+                        *)
+                            warn "Invalid input. Please type Y or N."
+                            ;;
+                    esac
+                done
             else
                 error "Non-interactive mode. Use --force to stop without confirmation."
                 exit 1
