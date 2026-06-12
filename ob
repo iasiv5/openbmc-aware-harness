@@ -3630,6 +3630,9 @@ cmd_start_qemu() {
         exit 0
     fi
 
+    # Ensure serial log directory exists
+    mkdir -p "$(dirname "$serial_log")"
+
     local qemu_stderr
     qemu_stderr=$(mktemp "${TMPDIR:-/tmp}/qemu-stderr-XXXXXX")
     if ! setsid "${QEMU_CMD[@]}" >"$qemu_stderr" 2>&1; then
